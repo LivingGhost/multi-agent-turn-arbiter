@@ -1,0 +1,53 @@
+{
+  "id": "multi-agent-turn-arbiter",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean" },
+      "enabledChannels": {
+        "type": "array",
+        "items": { "type": "string" },
+        "default": []
+      },
+      "leaseMs": {
+        "type": "number",
+        "default": 15000,
+        "minimum": 1000
+      },
+      "settleMs": {
+        "type": "number",
+        "default": 1500,
+        "minimum": 100
+      },
+      "botReopenCooldownMs": {
+        "type": "number",
+        "default": 15000,
+        "minimum": 0
+      },
+      "epochIdleMs": {
+        "type": "number",
+        "default": 3600000,
+        "minimum": 60000
+      },
+      "maxBotHops": {
+        "type": "number",
+        "default": 16,
+        "minimum": 1
+      },
+      "maxPromptChars": {
+        "type": "number",
+        "default": 60000,
+        "minimum": 4000
+      },
+      "failOpen": {
+        "type": "boolean",
+        "default": true
+      },
+      "debug": {
+        "type": "boolean",
+        "default": false
+      }
+    }
+  }
+}
