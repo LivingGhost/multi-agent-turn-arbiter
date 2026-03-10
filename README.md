@@ -18,8 +18,10 @@ The goal is practical coordination of visible output. It does not hard-cancel mo
 
 The plugin keeps short-lived in-memory state per conversation:
 
-- the latest visible message chain for the current epoch
+- a short retained visible backlog for the conversation
 - the current claim holder
+- active in-flight runs per agent
+- deferred wake state for busy agents
 - per-message decline state
 - dedupe and stale-message guards
 
@@ -37,7 +39,10 @@ It uses OpenClaw hooks such as:
 
 This plugin expects outbound hook metadata to include enough information to correlate sends back to the active conversation turn.
 
-In practice, it works best with an OpenClaw build that exposes outbound hook metadata like:
+In practice, it works best with an OpenClaw build that exposes:
+
+- inbound managed-sender metadata like `senderManagedAccountId`
+- outbound hook metadata like:
 
 - `conversationId`
 - `threadId`
@@ -64,12 +69,15 @@ Then allow and enable it in `openclaw.json`:
       "multi-agent-turn-arbiter": {
         "enabled": true,
         "config": {
-          "leaseMs": 15000,
-          "settleMs": 1500,
-          "botReopenCooldownMs": 15000,
-          "epochIdleMs": 3600000,
+          "enabledChannels": [],
+          "leaseMs": 30000,
+          "activeRunLeaseMs": 300000,
+          "settleMs": 10000,
+          "botReopenCooldownMs": 30000,
+          "epochIdleMs": 300000,
           "maxBotHops": 16,
-          "maxPromptChars": 60000,
+          "maxBacklogTurns": 6,
+          "maxPromptChars": 30000,
           "failOpen": true,
           "debug": false
         }
@@ -85,21 +93,23 @@ Then allow and enable it in `openclaw.json`:
 | --- | --- |
 | `enabled` | Turns the plugin on or off. |
 | `enabledChannels` | Optional allowlist of channel IDs. Empty means all channels. |
-| `leaseMs` | How long a claim stays valid without activity. |
-| `settleMs` | How long to wait for split/chunked visible output before finalizing a bot turn. |
-| `botReopenCooldownMs` | Cooldown that suppresses stale bot-root reopen attempts after a new visible root appears. |
-| `epochIdleMs` | Idle timeout for dropping old conversation epochs. |
-| `maxBotHops` | Maximum number of bot-to-bot hops before the epoch closes. |
-| `maxPromptChars` | Maximum characters of plugin-added visible transcript context before the epoch is closed. |
-| `failOpen` | If true, prefer letting delivery continue on plugin errors instead of blocking output. |
-| `debug` | Enables verbose plugin logging. |
+| `leaseMs` | How long a claim stays valid without activity. Default: `30000`. |
+| `activeRunLeaseMs` | Minimum lease for in-flight runs that already have a `runId`, so slow models are not treated as idle too early. Default: `300000`. |
+| `settleMs` | How long to wait for split/chunked visible output before finalizing a bot turn. Default: `10000`. |
+| `botReopenCooldownMs` | Cooldown that suppresses stale bot-root reopen attempts after a new visible root appears. Default: `30000`. |
+| `epochIdleMs` | Idle timeout for deleting a live epoch that stops progressing. Finished epochs are deleted immediately. Default: `300000`. |
+| `maxBotHops` | Maximum number of bot-to-bot hops before the epoch closes. Set `-1` for unlimited. Default: `16`. |
+| `maxBacklogTurns` | Maximum number of newest visible conversation turns to retain in plugin memory for deferred catch-up and prompt reconstruction. Consecutive visible messages from the same speaker count as one turn. Set `-1` for unlimited. Default: `6`. |
+| `maxPromptChars` | Character budget for plugin-added visible transcript context. Set `-1` for unlimited. The latest visible message is always kept, and older retained backlog messages are included from newest to oldest until the budget is filled. Default: `30000`. |
+| `failOpen` | If true, prefer letting delivery continue on plugin errors instead of blocking output. Default: `true`. |
+| `debug` | Enables verbose plugin logging. Default: `false`. |
 
 ## Limits
 
 - It serializes visible output, not hidden generation.
 - If a model run has already started, the plugin cannot guarantee hard cancellation.
 - Continuing multi-hop bot dialogue depends on visible bot messages being re-observed as inbound events by the host channel integration.
-- The plugin keeps only short-lived in-memory state. It is not a persistent transcript store.
+- The plugin keeps only short-lived in-memory state. Finished epochs are deleted immediately, idle live epochs age out after `epochIdleMs`, and retained visible backlog is capped by `maxBacklogTurns`. It is not a persistent transcript store.
 
 ## Repo layout
 
