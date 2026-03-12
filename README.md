@@ -112,8 +112,9 @@ Then allow and enable it in `openclaw.json`:
 - It serializes visible output, not hidden generation.
 - If a model run has already started, the plugin cannot hard-cancel it.
 - A slow agent may keep running in the background, but if newer visible room state supersedes it, its stale visible send is cancelled before delivery.
+- If a conversation was already marked pending when a newer inbound visible message arrives, deferred waiters are rebound to that newer visible source before launch.
 - Initial empty-state serialization uses a short bootstrap lock. If the plugin was restarted and still has no fresh visible backlog, the winner must rely on normal session history for that first reply.
-- Cleanup-triggered deferred wakes are launched only for the current conversation after the current inbound visible message has been recorded into plugin backlog state.
+- Cleanup only marks conversations as needing a deferred wake. Actual wake launches are limited to safe current-conversation request paths, after backlog state is already current, including run-end handoff on `agent_end`.
 - If one visible turn is split across multiple managed-agent messages, the plugin holds handoff until that sender run ends.
 - The plugin keeps only short-lived in-memory state. Older context is expected to come from normal OpenClaw session history, not from this plugin.
 

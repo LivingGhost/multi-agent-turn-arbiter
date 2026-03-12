@@ -117,6 +117,7 @@ const sendLocksByConversation = new Map<string, SendLockRecord>();
 const bootstrapLocksByConversation = new Map<string, BootstrapLockRecord>();
 const sourceLocksByConversation = new Map<string, SourceLockRecord>();
 const postSendGracesByConversationAgent = new Map<string, PostSendGraceRecord>();
+const pendingWakeConversations = new Map<string, number>();
 
 function nowMs(): number {
   return Date.now();
@@ -590,6 +591,29 @@ function clearDeferredWake(conversationKey: string, agentId: string): void {
   deferredWakesByConversationAgent.delete(makeConversationAgentKey(conversationKey, agentId));
 }
 
+function conversationHasDeferredWake(conversationKey: string): boolean {
+  for (const deferredWake of deferredWakesByConversationAgent.values()) {
+    if (deferredWake.conversationKey === conversationKey) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function markConversationNeedsWake(conversationKey: string | null | undefined): void {
+  const normalizedConversationKey = trimString(conversationKey);
+  if (!normalizedConversationKey) {
+    return;
+  }
+  pendingWakeConversations.set(normalizedConversationKey, nowMs());
+}
+
+function markConversationsNeedingWake(conversationKeys: Iterable<string>): void {
+  for (const conversationKey of conversationKeys) {
+    markConversationNeedsWake(conversationKey);
+  }
+}
+
 function reconcileDeferredWakesForSupersededSource(params: {
   conversationKey: string;
   supersededSourceMessageId: string;
@@ -600,6 +624,34 @@ function reconcileDeferredWakesForSupersededSource(params: {
     if (
       deferredWake.conversationKey !== params.conversationKey ||
       deferredWake.sourceMessageId !== params.supersededSourceMessageId
+    ) {
+      continue;
+    }
+    if (params.replacementEligibleAgents.includes(deferredWake.agentId)) {
+      rememberDeferredWake({
+        conversationKey: deferredWake.conversationKey,
+        channelId: deferredWake.channelId,
+        conversationId: deferredWake.conversationId,
+        agentId: deferredWake.agentId,
+        sourceMessageId: params.replacementSourceMessageId,
+        sessionKey: deferredWake.sessionKey,
+        sessionId: deferredWake.sessionId,
+      });
+      continue;
+    }
+    clearDeferredWake(deferredWake.conversationKey, deferredWake.agentId);
+  }
+}
+
+function rebaseDeferredWakesForLatestVisible(params: {
+  conversationKey: string;
+  replacementSourceMessageId: string;
+  replacementEligibleAgents: string[];
+}): void {
+  for (const deferredWake of [...deferredWakesByConversationAgent.values()]) {
+    if (
+      deferredWake.conversationKey !== params.conversationKey ||
+      deferredWake.sourceMessageId === params.replacementSourceMessageId
     ) {
       continue;
     }
@@ -972,6 +1024,11 @@ function cleanupState(
     clearSendLockForAgent(postSendGrace.conversationKey, postSendGrace.agentId);
     conversationsToWake.add(postSendGrace.conversationKey);
   }
+  for (const [conversationKey, markedAt] of pendingWakeConversations) {
+    if (now - markedAt > stateIdleMs) {
+      pendingWakeConversations.delete(conversationKey);
+    }
+  }
   return [...conversationsToWake];
 }
 
@@ -1260,36 +1317,38 @@ export default {
       }
     };
 
-    const cleanupAndMaybeLaunchConversation = async (
-      conversationKey: string | null | undefined,
-    ): Promise<void> => {
+    const cleanupAndMarkPendingWakes = (): void => {
       const conversationsToWake = cleanupState(
         stateIdleMs,
         reservationLeaseMs,
         activeRunLeaseMs,
         postSendGraceMs,
       );
-      if (conversationKey && conversationsToWake.includes(conversationKey)) {
-        await maybeLaunchDeferredWakesForConversation(conversationKey);
+      markConversationsNeedingWake(conversationsToWake);
+    };
+
+    const maybeLaunchPendingWakesForCurrentConversation = async (
+      conversationKey: string | null | undefined,
+    ): Promise<void> => {
+      const normalizedConversationKey = trimString(conversationKey);
+      if (!normalizedConversationKey || !pendingWakeConversations.has(normalizedConversationKey)) {
+        return;
+      }
+      pendingWakeConversations.delete(normalizedConversationKey);
+      await maybeLaunchDeferredWakesForConversation(normalizedConversationKey);
+      if (conversationHasDeferredWake(normalizedConversationKey)) {
+        pendingWakeConversations.set(normalizedConversationKey, nowMs());
       }
     };
 
     api.on("message_received", async (event, ctx) => {
       let currentConversationKey: string | null = null;
-      const cleanupWakeConversations = new Set<string>();
       try {
         if (!isEnabledForChannel(enabledChannels, trimString(ctx.channelId))) {
           return;
         }
 
-        for (const conversationKey of cleanupState(
-          stateIdleMs,
-          reservationLeaseMs,
-          activeRunLeaseMs,
-          postSendGraceMs,
-        )) {
-          cleanupWakeConversations.add(conversationKey);
-        }
+        cleanupAndMarkPendingWakes();
 
         const conversationKey = resolveInboundConversationKey(
           ctx.channelId,
@@ -1300,6 +1359,7 @@ export default {
         if (!conversationKey) {
           return;
         }
+        const conversationHadPendingWake = pendingWakeConversations.has(conversationKey);
 
         const conversationId = trimString(event.metadata?.["threadId"]) || trimString(ctx.conversationId);
         if (!conversationId) {
@@ -1354,6 +1414,13 @@ export default {
           ctx.channelId,
           agentAccounts,
         );
+        if (conversationHadPendingWake) {
+          rebaseDeferredWakesForLatestVisible({
+            conversationKey,
+            replacementSourceMessageId: visibleMessage.messageId,
+            replacementEligibleAgents: eligibleAgents,
+          });
+        }
         for (const targetAgentId of eligibleAgents) {
           const activeRun = getActiveRun(conversationKey, targetAgentId, activeRunLeaseMs);
           if (!activeRun && (!senderActiveRun || targetAgentId === senderAgentId)) {
@@ -1411,9 +1478,7 @@ export default {
           `multi-agent-turn-arbiter: message_received hook failed (${String(err)})`,
         );
       } finally {
-        if (currentConversationKey && cleanupWakeConversations.has(currentConversationKey)) {
-          await maybeLaunchDeferredWakesForConversation(currentConversationKey);
-        }
+        await maybeLaunchPendingWakesForCurrentConversation(currentConversationKey);
       }
     });
 
@@ -1431,7 +1496,7 @@ export default {
         if (!conversationKey || !agentId) {
           return;
         }
-        await cleanupAndMaybeLaunchConversation(conversationKey);
+        cleanupAndMarkPendingWakes();
 
         const promptState = resolvePromptState(conversationKey, agentId);
         const pendingSourceMessageId = buildPendingSourceMessageId(conversationKey);
@@ -1670,7 +1735,7 @@ export default {
         if (!conversationKey || !agentId) {
           return;
         }
-        await cleanupAndMaybeLaunchConversation(conversationKey);
+        cleanupAndMarkPendingWakes();
 
         const promptState = resolvePromptState(conversationKey, agentId);
         const pendingSourceMessageId = buildPendingSourceMessageId(conversationKey);
@@ -1758,7 +1823,7 @@ export default {
         if (!conversationKey || !agentId) {
           return;
         }
-        await cleanupAndMaybeLaunchConversation(conversationKey);
+        cleanupAndMarkPendingWakes();
 
         const activeRun = getActiveRun(conversationKey, agentId, activeRunLeaseMs);
         if (!activeRun) {
@@ -1787,7 +1852,8 @@ export default {
         clearPostSendGrace(conversationKey, agentId, activeRun.sourceMessageId);
         clearActiveRun(conversationKey, agentId);
         clearSendLockForAgent(conversationKey, agentId);
-        await maybeLaunchDeferredWakesForConversation(conversationKey);
+        markConversationNeedsWake(conversationKey);
+        await maybeLaunchPendingWakesForCurrentConversation(conversationKey);
       } catch (err) {
         api.logger.warn?.(`multi-agent-turn-arbiter: llm_output hook failed (${String(err)})`);
       }
@@ -1808,7 +1874,7 @@ export default {
         if (!conversationKey) {
           return;
         }
-        await cleanupAndMaybeLaunchConversation(conversationKey);
+        cleanupAndMarkPendingWakes();
 
         const accountId = trimString(ctx.accountId);
         const agentId = resolveOutboundAgentId(accountId || undefined, event.metadata, agentByAccount);
@@ -1819,6 +1885,8 @@ export default {
 
         const activeRun = getActiveRun(conversationKey, agentId, activeRunLeaseMs);
         if (!activeRun) {
+          markConversationNeedsWake(conversationKey);
+          await maybeLaunchPendingWakesForCurrentConversation(conversationKey);
           logDebug(api, debug, `cancelled outbound from ${agentId}; no active run for ${conversationKey}`);
           return { cancel: true };
         }
@@ -1830,7 +1898,8 @@ export default {
           clearPostSendGrace(conversationKey, agentId, activeRun.sourceMessageId);
           clearActiveRun(conversationKey, agentId);
           clearSendLockForAgent(conversationKey, agentId);
-          await maybeLaunchDeferredWakesForConversation(conversationKey);
+          markConversationNeedsWake(conversationKey);
+          await maybeLaunchPendingWakesForCurrentConversation(conversationKey);
           return { cancel: true };
         }
 
@@ -1846,6 +1915,8 @@ export default {
             clearPostSendGrace(conversationKey, agentId, activeRun.sourceMessageId);
             clearActiveRun(conversationKey, agentId);
             clearSendLockForAgent(conversationKey, agentId);
+            markConversationNeedsWake(conversationKey);
+            await maybeLaunchPendingWakesForCurrentConversation(conversationKey);
             logDebug(
               api,
               debug,
@@ -1869,6 +1940,8 @@ export default {
             clearPostSendGrace(conversationKey, agentId, activeRun.sourceMessageId);
             clearActiveRun(conversationKey, agentId);
             clearSendLockForAgent(conversationKey, agentId);
+            markConversationNeedsWake(conversationKey);
+            await maybeLaunchPendingWakesForCurrentConversation(conversationKey);
             logDebug(
               api,
               debug,
@@ -1889,7 +1962,8 @@ export default {
           clearPostSendGrace(conversationKey, agentId, activeRun.sourceMessageId);
           clearActiveRun(conversationKey, agentId);
           clearSendLockForAgent(conversationKey, agentId);
-          await maybeLaunchDeferredWakesForConversation(conversationKey);
+          markConversationNeedsWake(conversationKey);
+          await maybeLaunchPendingWakesForCurrentConversation(conversationKey);
           logDebug(
             api,
             debug,
@@ -1932,7 +2006,8 @@ export default {
           clearPostSendGrace(conversationKey, agentId, activeRun.sourceMessageId);
           clearActiveRun(conversationKey, agentId);
           clearSendLockForAgent(conversationKey, agentId);
-          await maybeLaunchDeferredWakesForConversation(conversationKey);
+          markConversationNeedsWake(conversationKey);
+          await maybeLaunchPendingWakesForCurrentConversation(conversationKey);
           logDebug(
             api,
             debug,
@@ -1952,7 +2027,8 @@ export default {
           clearPostSendGrace(conversationKey, agentId, activeRun.sourceMessageId);
           clearActiveRun(conversationKey, agentId);
           clearSendLockForAgent(conversationKey, agentId);
-          await maybeLaunchDeferredWakesForConversation(conversationKey);
+          markConversationNeedsWake(conversationKey);
+          await maybeLaunchPendingWakesForCurrentConversation(conversationKey);
           logDebug(
             api,
             debug,
@@ -2020,7 +2096,7 @@ export default {
         if (!conversationKey) {
           return;
         }
-        await cleanupAndMaybeLaunchConversation(conversationKey);
+        cleanupAndMarkPendingWakes();
 
         const accountId = trimString(ctx.accountId);
         const agentId = resolveOutboundAgentId(accountId || undefined, event.metadata, agentByAccount);
@@ -2088,7 +2164,8 @@ export default {
         clearPostSendGrace(conversationKey, agentId, activeRun?.sourceMessageId);
         clearActiveRun(conversationKey, agentId);
         clearSendLockForAgent(conversationKey, agentId);
-        await maybeLaunchDeferredWakesForConversation(conversationKey);
+        markConversationNeedsWake(conversationKey);
+        await maybeLaunchPendingWakesForCurrentConversation(conversationKey);
       } catch (err) {
         api.logger.warn?.(`multi-agent-turn-arbiter: message_sent hook failed (${String(err)})`);
       }
@@ -2105,7 +2182,7 @@ export default {
         if (!conversationKey || !agentId) {
           return;
         }
-        await cleanupAndMaybeLaunchConversation(conversationKey);
+        cleanupAndMarkPendingWakes();
 
         const activeRun = getActiveRun(conversationKey, agentId, activeRunLeaseMs);
         const sendLock = getSendLock(conversationKey, activeRunLeaseMs);
@@ -2116,7 +2193,8 @@ export default {
         if (sendLock?.agentId === agentId) {
           clearSendLockForAgent(conversationKey, agentId);
         }
-        await maybeLaunchDeferredWakesForConversation(conversationKey);
+        markConversationNeedsWake(conversationKey);
+        await maybeLaunchPendingWakesForCurrentConversation(conversationKey);
       } catch (err) {
         api.logger.warn?.(`multi-agent-turn-arbiter: agent_end hook failed (${String(err)})`);
       }
