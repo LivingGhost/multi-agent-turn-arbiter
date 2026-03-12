@@ -4,67 +4,17 @@ import type { OpenClawConfig, OpenClawPluginApi } from "openclaw/plugin-sdk";
 type ArbiterConfig = {
   enabled?: boolean;
   enabledChannels?: string[];
-  leaseMs?: number;
   activeRunLeaseMs?: number;
-  epochIdleMs?: number;
-  maxBotHops?: number;
+  reservationLeaseMs?: number;
+  postSendGraceMs?: number;
+  stateIdleMs?: number;
   maxBacklogTurns?: number;
   maxPromptChars?: number;
-  settleMs?: number;
-  botReopenCooldownMs?: number;
   failOpen?: boolean;
   debug?: boolean;
 };
 
-type BotReopenGuard = {
-  blockedUntil: number;
-  sourceMessageId: string;
-};
-
-type PendingSendAllowance = {
-  agentId: string;
-  grantedAt: number;
-  lastActivityAt: number;
-  sourceMessageId?: string;
-  sessionKey?: string;
-  sessionId?: string;
-  runId?: string;
-  approvedOutputTextNormalized?: string;
-  accountId?: string;
-};
-
-type ConversationLatestVisibleRecord = {
-  message: VisibleMessage;
-  updatedAt: number;
-};
-
-type ConversationVisibleHistoryRecord = {
-  messages: VisibleMessage[];
-  updatedAt: number;
-};
-
-type ActiveTurnRecord = {
-  conversationKey: string;
-  agentId: string;
-  sourceMessageId?: string;
-  claimedAt?: number;
-  updatedAt: number;
-  sessionKey?: string;
-  sessionId?: string;
-  runId?: string;
-};
-
-type DeferredBatonRecord = {
-  conversationKey: string;
-  channelId: string;
-  conversationId: string;
-  agentId: string;
-  sourceMessageId: string;
-  enqueuedAt: number;
-  updatedAt: number;
-  sessionKey?: string;
-  sessionId?: string;
-};
+type LockPhase = "reserved" | "active";
 
 type AgentAccountInfo = {
   channelId: string;
@@ -77,190 +27,99 @@ type VisibleMessage = {
   messageId: string;
   kind: "external" | "agent";
   content: string;
+  senderKey?: string;
   senderName?: string;
   senderAgentId?: string;
   timestamp: number;
 };
 
-type ClaimRecord = {
-  agentId: string;
-  accountId?: string;
-  sourceMessageId: string;
-  claimedAt: number;
-  lastActivityAt: number;
-  sessionKey?: string;
-  sessionId?: string;
-  runId?: string;
-  approvedOutputTextNormalized?: string;
-  sendCompletedAt?: number;
-  lastVisibleAt?: number;
-  observedMessageCount: number;
-  observedMessageIds?: string[];
-  expectedTextNormalized?: string;
-  observedTextNormalized?: string;
+type LatestVisibleRecord = {
+  message: VisibleMessage;
+  updatedAt: number;
 };
 
-type EpochRecord = {
-  epochId: string;
+type VisibleHistoryRecord = {
+  messages: VisibleMessage[];
+  updatedAt: number;
+};
+
+type ActiveRunRecord = {
   conversationKey: string;
   channelId: string;
   conversationId: string;
-  createdAt: number;
+  agentId: string;
+  sourceMessageId: string;
+  startedAt: number;
   updatedAt: number;
-  rootMessageId: string;
-  targetAgents: string[];
-  visibleMessages: VisibleMessage[];
-  claim?: ClaimRecord;
-  declinedByMessageId: Record<string, string[]>;
-  hopCount: number;
+  sessionKey?: string;
+  sessionId?: string;
+  runId?: string;
 };
 
-const epochsByConversation = new Map<string, EpochRecord>();
-const settleTimersByConversation = new Map<string, ReturnType<typeof setTimeout>>();
-const botReopenGuardsByConversation = new Map<string, BotReopenGuard>();
-const pendingAllowancesByConversation = new Map<string, PendingSendAllowance>();
-const latestVisibleByConversation = new Map<string, ConversationLatestVisibleRecord>();
-const visibleHistoryByConversation = new Map<string, ConversationVisibleHistoryRecord>();
-const activeTurnsByConversationAgent = new Map<string, ActiveTurnRecord>();
-const deferredBatonsByConversationAgent = new Map<string, DeferredBatonRecord>();
+type DeferredWakeRecord = {
+  conversationKey: string;
+  channelId: string;
+  conversationId: string;
+  agentId: string;
+  sourceMessageId: string;
+  enqueuedAt: number;
+  updatedAt: number;
+  sessionKey?: string;
+  sessionId?: string;
+};
 
-function clearSettleTimer(conversationKey: string): void {
-  const timer = settleTimersByConversation.get(conversationKey);
-  if (!timer) {
-    return;
-  }
-  clearTimeout(timer);
-  settleTimersByConversation.delete(conversationKey);
-}
+type SendLockRecord = {
+  conversationKey: string;
+  agentId: string;
+  sourceMessageId: string;
+  createdAt: number;
+  updatedAt: number;
+  sessionKey?: string;
+  sessionId?: string;
+};
 
-function deleteEpoch(conversationKey: string): void {
-  clearSettleTimer(conversationKey);
-  epochsByConversation.delete(conversationKey);
-}
+type BootstrapLockRecord = {
+  conversationKey: string;
+  agentId: string;
+  phase: LockPhase;
+  createdAt: number;
+  updatedAt: number;
+  sessionKey?: string;
+  sessionId?: string;
+};
 
-function setBotReopenGuard(conversationKey: string, sourceMessageId: string, cooldownMs: number): void {
-  if (cooldownMs <= 0) {
-    botReopenGuardsByConversation.delete(conversationKey);
-    return;
-  }
-  botReopenGuardsByConversation.set(conversationKey, {
-    blockedUntil: nowMs() + cooldownMs,
-    sourceMessageId,
-  });
-}
+type SourceLockRecord = {
+  conversationKey: string;
+  agentId: string;
+  sourceMessageId: string;
+  phase: LockPhase;
+  createdAt: number;
+  updatedAt: number;
+  sessionKey?: string;
+  sessionId?: string;
+};
 
-function clearBotReopenGuard(conversationKey: string): void {
-  botReopenGuardsByConversation.delete(conversationKey);
-}
+type PostSendGraceRecord = {
+  conversationKey: string;
+  agentId: string;
+  sourceMessageId: string;
+  createdAt: number;
+  updatedAt: number;
+  sessionKey?: string;
+  sessionId?: string;
+};
 
-function getActiveBotReopenGuard(conversationKey: string): BotReopenGuard | undefined {
-  const guard = botReopenGuardsByConversation.get(conversationKey);
-  if (!guard) {
-    return undefined;
-  }
-  if (guard.blockedUntil > nowMs()) {
-    return guard;
-  }
-  botReopenGuardsByConversation.delete(conversationKey);
-  return undefined;
-}
-
-function clearPendingAllowance(conversationKey: string): void {
-  pendingAllowancesByConversation.delete(conversationKey);
-}
-
-function touchPendingAllowance(allowance: PendingSendAllowance): void {
-  allowance.lastActivityAt = nowMs();
-}
-
-function setLatestVisible(conversationKey: string, message: VisibleMessage): void {
-  latestVisibleByConversation.set(conversationKey, {
-    message,
-    updatedAt: nowMs(),
-  });
-}
-
-function getLatestVisibleForConversation(
-  conversationKey: string,
-  idleMs: number,
-): VisibleMessage | undefined {
-  const existing = latestVisibleByConversation.get(conversationKey);
-  if (!existing) {
-    return undefined;
-  }
-  if (nowMs() - existing.updatedAt > idleMs) {
-    latestVisibleByConversation.delete(conversationKey);
-    return undefined;
-  }
-  return existing.message;
-}
-
-function appendConversationVisibleMessage(
-  conversationKey: string,
-  message: VisibleMessage,
-  maxBacklogTurns: number,
-): void {
-  const existing = visibleHistoryByConversation.get(conversationKey);
-  if (!existing) {
-    visibleHistoryByConversation.set(conversationKey, {
-      messages: trimVisibleHistoryToTailTurns([message], maxBacklogTurns),
-      updatedAt: nowMs(),
-    });
-    return;
-  }
-
-  const existingIndex = existing.messages.findIndex((entry) => entry.messageId === message.messageId);
-  if (existingIndex >= 0) {
-    existing.messages[existingIndex] = message;
-  } else {
-    existing.messages.push(message);
-  }
-  existing.messages = trimVisibleHistoryToTailTurns(existing.messages, maxBacklogTurns);
-  existing.updatedAt = nowMs();
-  visibleHistoryByConversation.set(conversationKey, existing);
-}
-
-function getConversationVisibleMessages(
-  conversationKey: string,
-  idleMs: number,
-): VisibleMessage[] {
-  const existing = visibleHistoryByConversation.get(conversationKey);
-  if (!existing) {
-    return [];
-  }
-  if (nowMs() - existing.updatedAt > idleMs) {
-    visibleHistoryByConversation.delete(conversationKey);
-    return [];
-  }
-  return existing.messages;
-}
-
-function getActivePendingAllowance(
-  conversationKey: string,
-  leaseMs: number,
-  activeRunLeaseMs: number,
-): PendingSendAllowance | undefined {
-  const allowance = pendingAllowancesByConversation.get(conversationKey);
-  if (!allowance) {
-    return undefined;
-  }
-  const activeLeaseMs = allowance.runId ? Math.max(leaseMs, activeRunLeaseMs) : leaseMs;
-  if (nowMs() - allowance.lastActivityAt <= activeLeaseMs) {
-    return allowance;
-  }
-  pendingAllowancesByConversation.delete(conversationKey);
-  return undefined;
-}
+const latestVisibleByConversation = new Map<string, LatestVisibleRecord>();
+const visibleHistoryByConversation = new Map<string, VisibleHistoryRecord>();
+const activeRunsByConversationAgent = new Map<string, ActiveRunRecord>();
+const deferredWakesByConversationAgent = new Map<string, DeferredWakeRecord>();
+const sendLocksByConversation = new Map<string, SendLockRecord>();
+const bootstrapLocksByConversation = new Map<string, BootstrapLockRecord>();
+const sourceLocksByConversation = new Map<string, SourceLockRecord>();
+const postSendGracesByConversationAgent = new Map<string, PostSendGraceRecord>();
 
 function nowMs(): number {
   return Date.now();
-}
-
-function sleepMs(ms: number): Promise<void> {
-  if (ms <= 0) {
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function trimString(value: unknown): string {
@@ -275,12 +134,34 @@ function uniqueStrings(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))];
 }
 
-function normalizeComparableText(value: string): string {
-  return value.replace(/\s+/g, " ").trim();
-}
-
 function isEnabledForChannel(enabledChannels: Set<string>, channelId: string): boolean {
   return enabledChannels.size === 0 || enabledChannels.has(channelId);
+}
+
+function getMetadataString(
+  metadata: Record<string, unknown> | undefined,
+  keys: string[],
+): string | undefined {
+  for (const key of keys) {
+    const value = trimString(metadata?.[key]);
+    if (value) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function resolveInboundSenderKey(metadata?: Record<string, unknown>): string | undefined {
+  return getMetadataString(metadata, [
+    "senderId",
+    "sender_id",
+    "authorId",
+    "author_id",
+    "userId",
+    "user_id",
+    "fromId",
+    "from_id",
+  ]);
 }
 
 function resolveMessageId(event: {
@@ -299,8 +180,7 @@ function resolveMessageId(event: {
   if (direct) {
     return direct;
   }
-  const basis = `${event.timestamp ?? 0}:${event.from}:${event.content}`;
-  return `derived-${makeHash(basis)}`;
+  return `derived-${makeHash(`${event.timestamp ?? 0}:${event.from}:${event.content}`)}`;
 }
 
 function resolveInboundConversationKey(
@@ -310,7 +190,7 @@ function resolveInboundConversationKey(
 ): string | null {
   const threadId = trimString(metadata?.["threadId"]);
   const base = threadId || trimString(conversationId);
-  if (!base) {
+  if (!channelId || !base) {
     return null;
   }
   return `${channelId}:${base}`;
@@ -324,7 +204,7 @@ function resolveOutboundConversationKey(
 ): string | null {
   const threadId = trimString(metadata?.["threadId"]);
   const base = threadId || trimString(conversationId) || trimString(to);
-  if (!base) {
+  if (!channelId || !base) {
     return null;
   }
   return `${channelId}:${base}`;
@@ -334,13 +214,13 @@ function resolveConversationKeyFromSessionKey(
   sessionKey: string | undefined,
   channelId: string | undefined,
 ): string | null {
-  const key = trimString(sessionKey);
-  const channel = trimString(channelId);
-  if (!key || !channel) {
+  const normalizedSessionKey = trimString(sessionKey);
+  const normalizedChannelId = trimString(channelId);
+  if (!normalizedSessionKey || !normalizedChannelId) {
     return null;
   }
-  const stripped = key.replace(/^agent:[^:]+:/, "");
-  if (!stripped.startsWith(`${channel}:`)) {
+  const stripped = normalizedSessionKey.replace(/^agent:[^:]+:/, "");
+  if (!stripped.startsWith(`${normalizedChannelId}:`)) {
     return null;
   }
   return stripped;
@@ -350,112 +230,12 @@ function buildDerivedSessionKey(agentId: string, conversationKey: string): strin
   return `agent:${trimString(agentId)}:${conversationKey}`;
 }
 
-function getMetadataString(
-  metadata: Record<string, unknown> | undefined,
-  keys: string[],
-): string | undefined {
-  for (const key of keys) {
-    const value = trimString(metadata?.[key]);
-    if (value) {
-      return value;
-    }
-  }
-  return undefined;
+function buildPendingSourceMessageId(conversationKey: string): string {
+  return `pending:${conversationKey}`;
 }
 
 function makeConversationAgentKey(conversationKey: string, agentId: string): string {
   return `${conversationKey}::${agentId}`;
-}
-
-function rememberActiveTurn(params: {
-  conversationKey: string;
-  agentId: string;
-  sourceMessageId?: string;
-  claimedAt?: number;
-  sessionKey?: string;
-  sessionId?: string;
-  runId?: string;
-}): void {
-  const key = makeConversationAgentKey(params.conversationKey, params.agentId);
-  const existing = activeTurnsByConversationAgent.get(key);
-  activeTurnsByConversationAgent.set(key, {
-    conversationKey: params.conversationKey,
-    agentId: params.agentId,
-    sourceMessageId: params.sourceMessageId ?? existing?.sourceMessageId,
-    claimedAt: params.claimedAt ?? existing?.claimedAt,
-    updatedAt: nowMs(),
-    sessionKey: params.sessionKey ?? existing?.sessionKey,
-    sessionId: params.sessionId ?? existing?.sessionId,
-    runId: params.runId ?? existing?.runId,
-  });
-}
-
-function getActiveTurn(
-  conversationKey: string,
-  agentId: string,
-  leaseMs: number,
-  activeRunLeaseMs: number,
-): ActiveTurnRecord | undefined {
-  const key = makeConversationAgentKey(conversationKey, agentId);
-  const activeTurn = activeTurnsByConversationAgent.get(key);
-  if (!activeTurn) {
-    return undefined;
-  }
-  const activeLeaseMs = activeTurn.runId ? Math.max(leaseMs, activeRunLeaseMs) : leaseMs;
-  if (nowMs() - activeTurn.updatedAt <= activeLeaseMs) {
-    return activeTurn;
-  }
-  activeTurnsByConversationAgent.delete(key);
-  return undefined;
-}
-
-function clearActiveTurn(conversationKey: string, agentId: string): void {
-  activeTurnsByConversationAgent.delete(makeConversationAgentKey(conversationKey, agentId));
-}
-
-function rememberDeferredBaton(params: {
-  conversationKey: string;
-  channelId: string;
-  conversationId: string;
-  agentId: string;
-  sourceMessageId: string;
-  sessionKey?: string;
-  sessionId?: string;
-}): void {
-  const key = makeConversationAgentKey(params.conversationKey, params.agentId);
-  const existing = deferredBatonsByConversationAgent.get(key);
-  deferredBatonsByConversationAgent.set(key, {
-    conversationKey: params.conversationKey,
-    channelId: params.channelId,
-    conversationId: params.conversationId,
-    agentId: params.agentId,
-    sourceMessageId: params.sourceMessageId,
-    enqueuedAt: existing?.enqueuedAt ?? nowMs(),
-    updatedAt: nowMs(),
-    sessionKey: params.sessionKey ?? existing?.sessionKey,
-    sessionId: params.sessionId ?? existing?.sessionId,
-  });
-}
-
-function getDeferredBaton(
-  conversationKey: string,
-  agentId: string,
-  idleMs: number,
-): DeferredBatonRecord | undefined {
-  const key = makeConversationAgentKey(conversationKey, agentId);
-  const baton = deferredBatonsByConversationAgent.get(key);
-  if (!baton) {
-    return undefined;
-  }
-  if (nowMs() - baton.updatedAt <= idleMs) {
-    return baton;
-  }
-  deferredBatonsByConversationAgent.delete(key);
-  return undefined;
-}
-
-function clearDeferredBaton(conversationKey: string, agentId: string): void {
-  deferredBatonsByConversationAgent.delete(makeConversationAgentKey(conversationKey, agentId));
 }
 
 function buildAgentAccounts(config: OpenClawConfig): AgentAccountInfo[] {
@@ -497,6 +277,16 @@ function buildAgentAccounts(config: OpenClawConfig): AgentAccountInfo[] {
   return out;
 }
 
+function buildAgentLabelById(infos: AgentAccountInfo[]): Map<string, string> {
+  const labels = new Map<string, string>();
+  for (const info of infos) {
+    if (!labels.has(info.agentId)) {
+      labels.set(info.agentId, info.displayNames[0] ?? info.agentId);
+    }
+  }
+  return labels;
+}
+
 function resolveOutboundAgentId(
   accountId: string | undefined,
   metadata: Record<string, unknown> | undefined,
@@ -534,11 +324,7 @@ function inferTargetAgents(
     }
   }
 
-  if (matchedAgents.size > 0) {
-    return uniqueStrings([...matchedAgents]);
-  }
-
-  return allAgents;
+  return matchedAgents.size > 0 ? uniqueStrings([...matchedAgents]) : allAgents;
 }
 
 function getAllChannelAgents(
@@ -555,20 +341,22 @@ function getAllChannelAgents(
   );
 }
 
-function buildAgentLabelById(infos: AgentAccountInfo[]): Map<string, string> {
-  const labels = new Map<string, string>();
-  for (const info of infos) {
-    if (!labels.has(info.agentId)) {
-      labels.set(info.agentId, info.displayNames[0] ?? info.agentId);
-    }
+function getEligibleAgentsForVisibleMessage(
+  message: VisibleMessage,
+  channelId: string,
+  infos: AgentAccountInfo[],
+): string[] {
+  if (message.kind === "external") {
+    return inferTargetAgents(message.content, channelId, infos);
   }
-  return labels;
+  return getAllChannelAgents(channelId, infos, { excludeAgentId: message.senderAgentId });
 }
 
 function makeVisibleMessage(params: {
   messageId: string;
   kind: "external" | "agent";
   content: string;
+  senderKey?: string;
   senderName?: string;
   senderAgentId?: string;
   timestamp?: number;
@@ -577,220 +365,16 @@ function makeVisibleMessage(params: {
     messageId: params.messageId,
     kind: params.kind,
     content: params.content,
+    senderKey: params.senderKey,
     senderName: params.senderName,
     senderAgentId: params.senderAgentId,
     timestamp: typeof params.timestamp === "number" ? params.timestamp : nowMs(),
   };
 }
 
-function makeEpoch(params: {
-  conversationKey: string;
-  channelId: string;
-  conversationId: string;
-  rootMessage: VisibleMessage;
-  targetAgents: string[];
-}): EpochRecord {
-  const timestamp = params.rootMessage.timestamp;
-  return {
-    epochId: `${params.conversationKey}:${params.rootMessage.messageId}`,
-    conversationKey: params.conversationKey,
-    channelId: params.channelId,
-    conversationId: params.conversationId,
-    createdAt: timestamp,
-    updatedAt: timestamp,
-    rootMessageId: params.rootMessage.messageId,
-    targetAgents: uniqueStrings(params.targetAgents),
-    visibleMessages: [params.rootMessage],
-    declinedByMessageId: {},
-    hopCount: 0,
-  };
-}
-
-function makePendingEpoch(params: {
-  conversationKey: string;
-  channelId: string;
-  conversationId: string;
-  targetAgents: string[];
-}): EpochRecord {
-  const timestamp = nowMs();
-  return {
-    epochId: `${params.conversationKey}:pending:${timestamp}`,
-    conversationKey: params.conversationKey,
-    channelId: params.channelId,
-    conversationId: params.conversationId,
-    createdAt: timestamp,
-    updatedAt: timestamp,
-    rootMessageId: `pending-${makeHash(`${params.conversationKey}:${timestamp}`)}`,
-    targetAgents: uniqueStrings(params.targetAgents),
-    visibleMessages: [],
-    declinedByMessageId: {},
-    hopCount: 0,
-  };
-}
-
-function getLatestVisible(epoch: EpochRecord): VisibleMessage | undefined {
-  return epoch.visibleMessages.at(-1);
-}
-
-function clearClaim(epoch: EpochRecord): void {
-  if (!epoch.claim) {
-    return;
-  }
-  clearActiveTurn(epoch.conversationKey, epoch.claim.agentId);
-  clearSettleTimer(epoch.conversationKey);
-  epoch.claim = undefined;
-  epoch.updatedAt = nowMs();
-}
-
-function touchClaim(claim: ClaimRecord): void {
-  claim.lastActivityAt = nowMs();
-}
-
-function maybeExpireClaim(epoch: EpochRecord, leaseMs: number, activeRunLeaseMs: number): boolean {
-  const claim = epoch.claim;
-  if (!claim) {
-    return false;
-  }
-  const activeLeaseMs =
-    claim.runId && !claim.sendCompletedAt ? Math.max(leaseMs, activeRunLeaseMs) : leaseMs;
-  const lastActivityAt = claim.lastActivityAt || claim.claimedAt;
-  if (nowMs() - lastActivityAt <= activeLeaseMs) {
-    return false;
-  }
-  clearClaim(epoch);
-  return true;
-}
-
-function cleanupEpochs(epochIdleMs: number, leaseMs: number, activeRunLeaseMs: number): void {
-  const now = nowMs();
-  for (const [conversationKey, guard] of botReopenGuardsByConversation) {
-    if (now >= guard.blockedUntil) {
-      botReopenGuardsByConversation.delete(conversationKey);
-    }
-  }
-  for (const [conversationKey, allowance] of pendingAllowancesByConversation) {
-    const activeLeaseMs = allowance.runId ? Math.max(leaseMs, activeRunLeaseMs) : leaseMs;
-    if (now - allowance.lastActivityAt > activeLeaseMs) {
-      pendingAllowancesByConversation.delete(conversationKey);
-    }
-  }
-  for (const [conversationKey, epoch] of epochsByConversation) {
-    maybeExpireClaim(epoch, leaseMs, activeRunLeaseMs);
-    if (now - epoch.updatedAt > epochIdleMs) {
-      deleteEpoch(conversationKey);
-    }
-  }
-  for (const [conversationKey, latestVisible] of latestVisibleByConversation) {
-    if (now - latestVisible.updatedAt > epochIdleMs) {
-      latestVisibleByConversation.delete(conversationKey);
-    }
-  }
-  for (const [conversationKey, visibleHistory] of visibleHistoryByConversation) {
-    if (now - visibleHistory.updatedAt > epochIdleMs) {
-      visibleHistoryByConversation.delete(conversationKey);
-    }
-  }
-  for (const [conversationAgentKey, activeTurn] of activeTurnsByConversationAgent) {
-    const activeLeaseMs = activeTurn.runId ? Math.max(leaseMs, activeRunLeaseMs) : leaseMs;
-    if (now - activeTurn.updatedAt > activeLeaseMs) {
-      activeTurnsByConversationAgent.delete(conversationAgentKey);
-    }
-  }
-  for (const [conversationAgentKey, deferredBaton] of deferredBatonsByConversationAgent) {
-    if (now - deferredBaton.updatedAt > epochIdleMs) {
-      deferredBatonsByConversationAgent.delete(conversationAgentKey);
-    }
-  }
-}
-
-function appendVisibleMessage(epoch: EpochRecord, message: VisibleMessage): boolean {
-  const existingIndex = epoch.visibleMessages.findIndex((entry) => entry.messageId === message.messageId);
-  if (existingIndex >= 0) {
-    epoch.visibleMessages[existingIndex] = message;
-    epoch.updatedAt = nowMs();
-    return false;
-  }
-  epoch.visibleMessages.push(message);
-  epoch.updatedAt = nowMs();
-  return true;
-}
-
-function isSameVisibleMessage(a: VisibleMessage, b: VisibleMessage): boolean {
-  return (
-    a.kind === b.kind &&
-    trimString(a.senderAgentId) === trimString(b.senderAgentId) &&
-    trimString(a.senderName) === trimString(b.senderName) &&
-    normalizeComparableText(a.content) === normalizeComparableText(b.content)
-  );
-}
-
-function hasVisibleMessage(epoch: EpochRecord, messageId: string): boolean {
-  return epoch.visibleMessages.some((entry) => entry.messageId === messageId);
-}
-
-function recomputeClaimObservedText(epoch: EpochRecord, claim: ClaimRecord): void {
-  const observedMessageIds = claim.observedMessageIds ?? [];
-  const observedParts = observedMessageIds
-    .map((messageId) => epoch.visibleMessages.find((entry) => entry.messageId === messageId)?.content ?? "")
-    .filter((content) => Boolean(normalizeComparableText(content)));
-  claim.observedMessageCount = observedMessageIds.length;
-  claim.observedTextNormalized =
-    observedParts.length > 0 ? normalizeComparableText(observedParts.join("\n")) : undefined;
-}
-
-function getEligibleAgents(epoch: EpochRecord): string[] {
-  const latest = getLatestVisible(epoch);
-  if (!latest) {
-    return [];
-  }
-  if (latest.kind === "agent" && latest.senderAgentId) {
-    return epoch.targetAgents.filter((agentId) => agentId !== latest.senderAgentId);
-  }
-  return [...epoch.targetAgents];
-}
-
-function getDeclinedAgents(epoch: EpochRecord, messageId: string): Set<string> {
-  return new Set(epoch.declinedByMessageId[messageId] ?? []);
-}
-
-function markDeclined(epoch: EpochRecord, agentId: string, messageId: string): void {
-  const current = new Set(epoch.declinedByMessageId[messageId] ?? []);
-  current.add(agentId);
-  epoch.declinedByMessageId[messageId] = [...current];
-  epoch.updatedAt = nowMs();
-}
-
-function haveAllEligibleAgentsDeclined(epoch: EpochRecord, messageId: string): boolean {
-  const latest = getLatestVisible(epoch);
-  if (!latest || latest.messageId !== messageId) {
-    return false;
-  }
-  const eligible = getEligibleAgents(epoch);
-  if (eligible.length === 0) {
-    return true;
-  }
-  const declined = getDeclinedAgents(epoch, messageId);
-  return eligible.every((agentId) => declined.has(agentId));
-}
-
-function formatSpeakerLabel(message: VisibleMessage, agentLabelById: Map<string, string>): string {
-  if (message.kind === "external") {
-    return message.senderName || "External";
-  }
-  if (message.senderAgentId) {
-    return agentLabelById.get(message.senderAgentId) ?? message.senderName ?? message.senderAgentId;
-  }
-  return message.senderName || "Agent";
-}
-
-function formatTranscriptEntry(
-  message: VisibleMessage,
-  index: number,
-  agentLabelById: Map<string, string>,
-): string {
-  const speakerKind = message.kind === "external" ? "External" : "Agent";
-  const speaker = formatSpeakerLabel(message, agentLabelById);
-  return `[${index + 1}] ${speakerKind} ${speaker} (messageId=${message.messageId})\n${message.content}`;
+function isOnlyNoReplyOutput(texts: string[]): boolean {
+  const normalized = texts.map((entry) => entry.trim()).filter(Boolean);
+  return normalized.length > 0 && normalized.every((entry) => entry === "NO_REPLY");
 }
 
 function getTurnSpeakerKey(message: VisibleMessage): string {
@@ -800,12 +384,14 @@ function getTurnSpeakerKey(message: VisibleMessage): string {
       return `agent:${agentId}`;
     }
   }
-
+  const senderKey = trimString(message.senderKey);
+  if (senderKey) {
+    return `${message.kind}:${senderKey}`;
+  }
   const senderName = trimString(message.senderName);
   if (senderName) {
     return `${message.kind}:${senderName}`;
   }
-
   return `${message.kind}:message:${message.messageId}`;
 }
 
@@ -844,111 +430,478 @@ function trimVisibleHistoryToTailTurns(
   if (maxBacklogTurns === -1 || messages.length === 0) {
     return messages;
   }
-
   return selectNewestTurnEntries(
     messages.map((message, index) => ({ message, index })),
     maxBacklogTurns,
   ).map(({ message }) => message);
 }
 
-function buildTailTranscript(params: {
-  messages: VisibleMessage[];
+function setLatestVisible(conversationKey: string, message: VisibleMessage): void {
+  latestVisibleByConversation.set(conversationKey, {
+    message,
+    updatedAt: nowMs(),
+  });
+}
+
+function getLatestVisibleForConversation(
+  conversationKey: string,
+  stateIdleMs: number,
+): VisibleMessage | undefined {
+  const existing = latestVisibleByConversation.get(conversationKey);
+  if (!existing) {
+    return undefined;
+  }
+  if (nowMs() - existing.updatedAt > stateIdleMs) {
+    latestVisibleByConversation.delete(conversationKey);
+    return undefined;
+  }
+  return existing.message;
+}
+
+function appendConversationVisibleMessage(
+  conversationKey: string,
+  message: VisibleMessage,
+  maxBacklogTurns: number,
+): void {
+  const existing = visibleHistoryByConversation.get(conversationKey);
+  if (!existing) {
+    visibleHistoryByConversation.set(conversationKey, {
+      messages: trimVisibleHistoryToTailTurns([message], maxBacklogTurns),
+      updatedAt: nowMs(),
+    });
+    return;
+  }
+
+  const existingIndex = existing.messages.findIndex((entry) => entry.messageId === message.messageId);
+  if (existingIndex >= 0) {
+    existing.messages[existingIndex] = message;
+  } else {
+    existing.messages.push(message);
+  }
+  existing.messages = trimVisibleHistoryToTailTurns(existing.messages, maxBacklogTurns);
+  existing.updatedAt = nowMs();
+  visibleHistoryByConversation.set(conversationKey, existing);
+}
+
+function getConversationVisibleMessages(
+  conversationKey: string,
+  stateIdleMs: number,
+): VisibleMessage[] {
+  const existing = visibleHistoryByConversation.get(conversationKey);
+  if (!existing) {
+    return [];
+  }
+  if (nowMs() - existing.updatedAt > stateIdleMs) {
+    visibleHistoryByConversation.delete(conversationKey);
+    return [];
+  }
+  return existing.messages;
+}
+
+function rememberActiveRun(params: {
+  conversationKey: string;
+  channelId: string;
+  conversationId: string;
+  agentId: string;
+  sourceMessageId: string;
+  sessionKey?: string;
+  sessionId?: string;
+  runId?: string;
+}): void {
+  const key = makeConversationAgentKey(params.conversationKey, params.agentId);
+  const existing = activeRunsByConversationAgent.get(key);
+  activeRunsByConversationAgent.set(key, {
+    conversationKey: params.conversationKey,
+    channelId: params.channelId,
+    conversationId: params.conversationId,
+    agentId: params.agentId,
+    sourceMessageId: params.sourceMessageId || existing?.sourceMessageId || "",
+    startedAt: existing?.startedAt ?? nowMs(),
+    updatedAt: nowMs(),
+    sessionKey: params.sessionKey ?? existing?.sessionKey,
+    sessionId: params.sessionId ?? existing?.sessionId,
+    runId: params.runId ?? existing?.runId,
+  });
+}
+
+function getActiveRun(
+  conversationKey: string,
+  agentId: string,
+  activeRunLeaseMs: number,
+): ActiveRunRecord | undefined {
+  const key = makeConversationAgentKey(conversationKey, agentId);
+  const existing = activeRunsByConversationAgent.get(key);
+  if (!existing) {
+    return undefined;
+  }
+  if (nowMs() - existing.updatedAt <= activeRunLeaseMs) {
+    return existing;
+  }
+  activeRunsByConversationAgent.delete(key);
+  return undefined;
+}
+
+function clearActiveRun(conversationKey: string, agentId: string): void {
+  activeRunsByConversationAgent.delete(makeConversationAgentKey(conversationKey, agentId));
+}
+
+function rememberDeferredWake(params: {
+  conversationKey: string;
+  channelId: string;
+  conversationId: string;
+  agentId: string;
+  sourceMessageId: string;
+  sessionKey?: string;
+  sessionId?: string;
+}): void {
+  const key = makeConversationAgentKey(params.conversationKey, params.agentId);
+  const existing = deferredWakesByConversationAgent.get(key);
+  deferredWakesByConversationAgent.set(key, {
+    conversationKey: params.conversationKey,
+    channelId: params.channelId,
+    conversationId: params.conversationId,
+    agentId: params.agentId,
+    sourceMessageId: params.sourceMessageId,
+    enqueuedAt: existing?.enqueuedAt ?? nowMs(),
+    updatedAt: nowMs(),
+    sessionKey: params.sessionKey ?? existing?.sessionKey,
+    sessionId: params.sessionId ?? existing?.sessionId,
+  });
+}
+
+function getDeferredWake(
+  conversationKey: string,
+  agentId: string,
+  stateIdleMs: number,
+): DeferredWakeRecord | undefined {
+  const key = makeConversationAgentKey(conversationKey, agentId);
+  const existing = deferredWakesByConversationAgent.get(key);
+  if (!existing) {
+    return undefined;
+  }
+  if (nowMs() - existing.updatedAt <= stateIdleMs) {
+    return existing;
+  }
+  deferredWakesByConversationAgent.delete(key);
+  return undefined;
+}
+
+function clearDeferredWake(conversationKey: string, agentId: string): void {
+  deferredWakesByConversationAgent.delete(makeConversationAgentKey(conversationKey, agentId));
+}
+
+function reconcileDeferredWakesForSupersededSource(params: {
+  conversationKey: string;
+  supersededSourceMessageId: string;
+  replacementSourceMessageId: string;
+  replacementEligibleAgents: string[];
+}): void {
+  for (const deferredWake of deferredWakesByConversationAgent.values()) {
+    if (
+      deferredWake.conversationKey !== params.conversationKey ||
+      deferredWake.sourceMessageId !== params.supersededSourceMessageId
+    ) {
+      continue;
+    }
+    if (params.replacementEligibleAgents.includes(deferredWake.agentId)) {
+      rememberDeferredWake({
+        conversationKey: deferredWake.conversationKey,
+        channelId: deferredWake.channelId,
+        conversationId: deferredWake.conversationId,
+        agentId: deferredWake.agentId,
+        sourceMessageId: params.replacementSourceMessageId,
+        sessionKey: deferredWake.sessionKey,
+        sessionId: deferredWake.sessionId,
+      });
+      continue;
+    }
+    clearDeferredWake(deferredWake.conversationKey, deferredWake.agentId);
+  }
+}
+
+function getSendLock(
+  conversationKey: string,
+  activeRunLeaseMs: number,
+): SendLockRecord | undefined {
+  const existing = sendLocksByConversation.get(conversationKey);
+  if (!existing) {
+    return undefined;
+  }
+  if (nowMs() - existing.updatedAt <= activeRunLeaseMs) {
+    return existing;
+  }
+  sendLocksByConversation.delete(conversationKey);
+  return undefined;
+}
+
+function setSendLock(params: {
+  conversationKey: string;
+  agentId: string;
+  sourceMessageId: string;
+  sessionKey?: string;
+  sessionId?: string;
+}): void {
+  sendLocksByConversation.set(params.conversationKey, {
+    conversationKey: params.conversationKey,
+    agentId: params.agentId,
+    sourceMessageId: params.sourceMessageId,
+    createdAt: nowMs(),
+    updatedAt: nowMs(),
+    sessionKey: params.sessionKey,
+    sessionId: params.sessionId,
+  });
+}
+
+function clearSendLockForAgent(conversationKey: string, agentId: string): void {
+  const existing = sendLocksByConversation.get(conversationKey);
+  if (existing?.agentId === agentId) {
+    sendLocksByConversation.delete(conversationKey);
+  }
+}
+
+function getLockLeaseMs(
+  phase: LockPhase,
+  reservationLeaseMs: number,
+  activeRunLeaseMs: number,
+): number {
+  return phase === "active" ? activeRunLeaseMs : reservationLeaseMs;
+}
+
+function getBootstrapLock(
+  conversationKey: string,
+  reservationLeaseMs: number,
+  activeRunLeaseMs: number,
+): BootstrapLockRecord | undefined {
+  const existing = bootstrapLocksByConversation.get(conversationKey);
+  if (!existing) {
+    return undefined;
+  }
+  const leaseMs = getLockLeaseMs(existing.phase, reservationLeaseMs, activeRunLeaseMs);
+  if (nowMs() - existing.updatedAt <= leaseMs) {
+    return existing;
+  }
+  bootstrapLocksByConversation.delete(conversationKey);
+  return undefined;
+}
+
+function setBootstrapLock(params: {
+  conversationKey: string;
+  agentId: string;
+  phase: LockPhase;
+  sessionKey?: string;
+  sessionId?: string;
+}): void {
+  const existing = bootstrapLocksByConversation.get(params.conversationKey);
+  bootstrapLocksByConversation.set(params.conversationKey, {
+    conversationKey: params.conversationKey,
+    agentId: params.agentId,
+    phase: params.phase,
+    createdAt: existing?.createdAt ?? nowMs(),
+    updatedAt: nowMs(),
+    sessionKey: params.sessionKey,
+    sessionId: params.sessionId,
+  });
+}
+
+function clearBootstrapLockForAgent(conversationKey: string, agentId: string): void {
+  const existing = bootstrapLocksByConversation.get(conversationKey);
+  if (existing?.agentId === agentId) {
+    bootstrapLocksByConversation.delete(conversationKey);
+  }
+}
+
+function getSourceLock(
+  conversationKey: string,
+  reservationLeaseMs: number,
+  activeRunLeaseMs: number,
+): SourceLockRecord | undefined {
+  const existing = sourceLocksByConversation.get(conversationKey);
+  if (!existing) {
+    return undefined;
+  }
+  const leaseMs = getLockLeaseMs(existing.phase, reservationLeaseMs, activeRunLeaseMs);
+  if (nowMs() - existing.updatedAt <= leaseMs) {
+    return existing;
+  }
+  sourceLocksByConversation.delete(conversationKey);
+  return undefined;
+}
+
+function setSourceLock(params: {
+  conversationKey: string;
+  agentId: string;
+  sourceMessageId: string;
+  phase: LockPhase;
+  sessionKey?: string;
+  sessionId?: string;
+}): void {
+  const existing = sourceLocksByConversation.get(params.conversationKey);
+  sourceLocksByConversation.set(params.conversationKey, {
+    conversationKey: params.conversationKey,
+    agentId: params.agentId,
+    sourceMessageId: params.sourceMessageId,
+    phase: params.phase,
+    createdAt: existing?.createdAt ?? nowMs(),
+    updatedAt: nowMs(),
+    sessionKey: params.sessionKey,
+    sessionId: params.sessionId,
+  });
+}
+
+function clearSourceLockForAgent(
+  conversationKey: string,
+  agentId: string,
+  sourceMessageId?: string,
+): void {
+  const existing = sourceLocksByConversation.get(conversationKey);
+  if (!existing || existing.agentId !== agentId) {
+    return;
+  }
+  if (sourceMessageId && existing.sourceMessageId !== sourceMessageId) {
+    return;
+  }
+  sourceLocksByConversation.delete(conversationKey);
+}
+
+function rememberPostSendGrace(params: {
+  conversationKey: string;
+  agentId: string;
+  sourceMessageId: string;
+  sessionKey?: string;
+  sessionId?: string;
+}): void {
+  const key = makeConversationAgentKey(params.conversationKey, params.agentId);
+  const existing = postSendGracesByConversationAgent.get(key);
+  postSendGracesByConversationAgent.set(key, {
+    conversationKey: params.conversationKey,
+    agentId: params.agentId,
+    sourceMessageId: params.sourceMessageId,
+    createdAt: existing?.createdAt ?? nowMs(),
+    updatedAt: nowMs(),
+    sessionKey: params.sessionKey ?? existing?.sessionKey,
+    sessionId: params.sessionId ?? existing?.sessionId,
+  });
+}
+
+function clearPostSendGrace(
+  conversationKey: string,
+  agentId: string,
+  sourceMessageId?: string,
+): void {
+  const key = makeConversationAgentKey(conversationKey, agentId);
+  const existing = postSendGracesByConversationAgent.get(key);
+  if (!existing) {
+    return;
+  }
+  if (sourceMessageId && existing.sourceMessageId !== sourceMessageId) {
+    return;
+  }
+  postSendGracesByConversationAgent.delete(key);
+}
+
+function formatSpeakerLabel(message: VisibleMessage, agentLabelById: Map<string, string>): string {
+  if (message.kind === "external") {
+    return message.senderName || message.senderKey || "External";
+  }
+  if (message.senderAgentId) {
+    return agentLabelById.get(message.senderAgentId) ?? message.senderName ?? message.senderAgentId;
+  }
+  return message.senderName || "Agent";
+}
+
+function formatTranscriptEntry(
+  message: VisibleMessage,
+  index: number,
+  agentLabelById: Map<string, string>,
+): string {
+  const speakerKind = message.kind === "external" ? "External" : "Agent";
+  const speaker = formatSpeakerLabel(message, agentLabelById);
+  return `[${index + 1}] ${speakerKind} ${speaker} (messageId=${message.messageId})\n${message.content}`;
+}
+
+function buildTranscriptContext(params: {
+  visibleMessages: VisibleMessage[];
+  focusMessage?: VisibleMessage;
+  latestVisible?: VisibleMessage;
   agentLabelById: Map<string, string>;
   maxPromptChars: number;
-  prependSystemContext: string;
-  latestLabel: string;
 }): string {
-  const header = [
-    "Authoritative raw visible conversation tail for the current baton conversation.",
-    `Current visible message: ${params.latestLabel}.`,
-    "Transcript tail for current conversation (oldest first, truncated from the start if needed):",
-  ].join("\n\n");
-  const entries = params.messages.map((message, index) => ({
-    message,
-    index,
-    text: formatTranscriptEntry(message, index, params.agentLabelById),
-  }));
-  if (entries.length === 0) {
+  const headerLines = [
+    "Authoritative raw visible conversation backlog for the shared multi-agent baton conversation.",
+  ];
+  if (params.focusMessage) {
+    headerLines.push(
+      `Focus visible message: ${formatSpeakerLabel(params.focusMessage, params.agentLabelById)} (messageId=${params.focusMessage.messageId}).`,
+    );
+  }
+  if (params.latestVisible) {
+    headerLines.push(
+      `Latest visible message in the room: ${formatSpeakerLabel(params.latestVisible, params.agentLabelById)} (messageId=${params.latestVisible.messageId}).`,
+    );
+  }
+  headerLines.push("Visible backlog (oldest first, trimmed from the start if needed):");
+  const header = headerLines.join("\n\n");
+
+  if (params.visibleMessages.length === 0) {
     return header;
   }
 
-  const tailTexts = entries.map(({ message, index }) =>
+  const entryTexts = params.visibleMessages.map((message, index) =>
     formatTranscriptEntry(message, index, params.agentLabelById),
   );
   if (params.maxPromptChars === -1) {
-    return [header, ...tailTexts].join("\n\n");
+    return [header, ...entryTexts].join("\n\n");
   }
 
-  const budget = Math.max(0, params.maxPromptChars - `${params.prependSystemContext}\n\n${header}`.length);
-  const selected: string[] = [tailTexts.at(-1) ?? ""];
-  let used = selected[0].length;
-  for (let index = tailTexts.length - 2; index >= 0; index -= 1) {
-    const candidate = tailTexts[index];
-    const nextUsed = used + 2 + candidate.length;
-    if (nextUsed > budget) {
+  const budget = Math.max(0, params.maxPromptChars - header.length - 2);
+  const selected: string[] = [];
+  let used = 0;
+  for (let index = entryTexts.length - 1; index >= 0; index -= 1) {
+    const candidate = entryTexts[index];
+    const nextUsed = selected.length === 0 ? candidate.length : used + 2 + candidate.length;
+    if (selected.length > 0 && nextUsed > budget) {
       break;
     }
     selected.push(candidate);
-    used = nextUsed;
+    used = selected.length === 1 ? candidate.length : nextUsed;
   }
 
   return [header, ...selected.reverse()].join("\n\n");
 }
 
 function buildPromptContext(params: {
-  epoch: EpochRecord;
   visibleMessages: VisibleMessage[];
-  agentLabelById: Map<string, string>;
-  maxPromptChars: number;
-}): { prependSystemContext: string; prependContext: string } | null {
-  const latest = getLatestVisible(params.epoch);
-  if (!latest) {
-    return null;
-  }
-  const latestLabel = formatSpeakerLabel(latest, params.agentLabelById);
-  const prependSystemContext = [
-    "You are participating in a multi-agent baton conversation.",
-    "If you decide not to add a reply after reading the conversation context, output only NO_REPLY.",
-  ].join("\n");
-  const prependContext = buildTailTranscript({
-    messages: params.visibleMessages,
-    agentLabelById: params.agentLabelById,
-    maxPromptChars: params.maxPromptChars,
-    prependSystemContext,
-    latestLabel: `${latestLabel} (messageId=${latest.messageId})`,
-  });
-  return {
-    prependSystemContext,
-    prependContext,
-  };
-}
-
-function buildPendingPromptContext(params: {
-  visibleMessages: VisibleMessage[];
+  focusMessage?: VisibleMessage;
+  latestVisible?: VisibleMessage;
   agentLabelById: Map<string, string>;
   maxPromptChars: number;
 }): {
   prependSystemContext: string;
   prependContext: string;
 } {
-  const latest = params.visibleMessages.at(-1);
   const prependSystemContext = [
-    "You are participating in a multi-agent baton conversation.",
-    "You currently own the pending baton for the next visible reply.",
+    "You are participating in a shared multi-agent conversation.",
+    "Reply to the focus visible message using the visible backlog below.",
     "If you decide not to add a reply, output only NO_REPLY.",
   ].join("\n");
-  const prependContext = latest
-    ? buildTailTranscript({
-        messages: params.visibleMessages,
-        agentLabelById: params.agentLabelById,
-        maxPromptChars: params.maxPromptChars,
-        prependSystemContext,
-        latestLabel: `${formatSpeakerLabel(latest, params.agentLabelById)} (messageId=${latest.messageId})`,
-      })
-    : "Reply to the latest visible message already present in the conversation history.";
   return {
     prependSystemContext,
-    prependContext,
+    prependContext: buildTranscriptContext(params),
+  };
+}
+
+function buildInitialPromptContext(): {
+  prependSystemContext: string;
+  prependContext: string;
+} {
+  return {
+    prependSystemContext: [
+      "You are participating in a shared multi-agent conversation.",
+      "No fresh visible backlog is currently cached by the plugin.",
+      "Reply only if the existing conversation history already gives you enough context.",
+      "If you decide not to add a reply, output only NO_REPLY.",
+    ].join("\n"),
+    prependContext: "Reply to the latest visible message already present in the normal conversation history.",
   };
 }
 
@@ -956,9 +909,70 @@ function denyContext(message: string): { prependSystemContext: string } {
   return { prependSystemContext: `${message} Output only NO_REPLY.` };
 }
 
-function isOnlyNoReplyOutput(texts: string[]): boolean {
-  const normalized = texts.map((entry) => entry.trim()).filter(Boolean);
-  return normalized.length > 0 && normalized.every((entry) => entry === "NO_REPLY");
+function cleanupState(
+  stateIdleMs: number,
+  reservationLeaseMs: number,
+  activeRunLeaseMs: number,
+  postSendGraceMs: number,
+): string[] {
+  const now = nowMs();
+  const conversationsToWake = new Set<string>();
+  for (const [conversationKey, latestVisible] of latestVisibleByConversation) {
+    if (now - latestVisible.updatedAt > stateIdleMs) {
+      latestVisibleByConversation.delete(conversationKey);
+    }
+  }
+  for (const [conversationKey, visibleHistory] of visibleHistoryByConversation) {
+    if (now - visibleHistory.updatedAt > stateIdleMs) {
+      visibleHistoryByConversation.delete(conversationKey);
+    }
+  }
+  for (const [conversationAgentKey, activeRun] of activeRunsByConversationAgent) {
+    if (now - activeRun.updatedAt > activeRunLeaseMs) {
+      activeRunsByConversationAgent.delete(conversationAgentKey);
+      conversationsToWake.add(activeRun.conversationKey);
+    }
+  }
+  for (const [conversationAgentKey, deferredWake] of deferredWakesByConversationAgent) {
+    if (now - deferredWake.updatedAt > stateIdleMs) {
+      deferredWakesByConversationAgent.delete(conversationAgentKey);
+    }
+  }
+  for (const [conversationKey, sendLock] of sendLocksByConversation) {
+    if (now - sendLock.updatedAt > activeRunLeaseMs) {
+      sendLocksByConversation.delete(conversationKey);
+    }
+  }
+  for (const [conversationKey, bootstrapLock] of bootstrapLocksByConversation) {
+    const leaseMs = getLockLeaseMs(bootstrapLock.phase, reservationLeaseMs, activeRunLeaseMs);
+    if (now - bootstrapLock.updatedAt > leaseMs) {
+      bootstrapLocksByConversation.delete(conversationKey);
+      conversationsToWake.add(conversationKey);
+    }
+  }
+  for (const [conversationKey, sourceLock] of sourceLocksByConversation) {
+    const leaseMs = getLockLeaseMs(sourceLock.phase, reservationLeaseMs, activeRunLeaseMs);
+    if (now - sourceLock.updatedAt > leaseMs) {
+      sourceLocksByConversation.delete(conversationKey);
+      conversationsToWake.add(conversationKey);
+    }
+  }
+  for (const [conversationAgentKey, postSendGrace] of postSendGracesByConversationAgent) {
+    if (now - postSendGrace.updatedAt <= postSendGraceMs) {
+      continue;
+    }
+    postSendGracesByConversationAgent.delete(conversationAgentKey);
+    clearActiveRun(postSendGrace.conversationKey, postSendGrace.agentId);
+    clearBootstrapLockForAgent(postSendGrace.conversationKey, postSendGrace.agentId);
+    clearSourceLockForAgent(
+      postSendGrace.conversationKey,
+      postSendGrace.agentId,
+      postSendGrace.sourceMessageId,
+    );
+    clearSendLockForAgent(postSendGrace.conversationKey, postSendGrace.agentId);
+    conversationsToWake.add(postSendGrace.conversationKey);
+  }
+  return [...conversationsToWake];
 }
 
 function logDebug(api: OpenClawPluginApi, debug: boolean, message: string): void {
@@ -968,49 +982,11 @@ function logDebug(api: OpenClawPluginApi, debug: boolean, message: string): void
   api.logger.info?.(`multi-agent-turn-arbiter: ${message}`);
 }
 
-function isSameAllowanceOwner(params: {
-  allowance: PendingSendAllowance;
-  agentId: string;
-  sessionKey?: string;
-  sessionId?: string;
-}): boolean {
-  const { allowance, agentId, sessionKey, sessionId } = params;
-  if (allowance.agentId !== agentId) {
-    return false;
-  }
-  if (allowance.sessionKey && sessionKey && allowance.sessionKey !== sessionKey) {
-    return false;
-  }
-  if (allowance.sessionId && sessionId && allowance.sessionId !== sessionId) {
-    return false;
-  }
-  return true;
-}
-
-function makeClaimFromPendingAllowance(
-  allowance: PendingSendAllowance,
-  sourceMessageId: string,
-): ClaimRecord {
-  return {
-    agentId: allowance.agentId,
-    accountId: allowance.accountId,
-    sourceMessageId,
-    claimedAt: allowance.grantedAt,
-    lastActivityAt: allowance.lastActivityAt,
-    sessionKey: allowance.sessionKey,
-    sessionId: allowance.sessionId,
-    runId: allowance.runId,
-    approvedOutputTextNormalized: allowance.approvedOutputTextNormalized,
-    observedMessageCount: 0,
-    observedMessageIds: [],
-  };
-}
-
 export default {
   id: "multi-agent-turn-arbiter",
   name: "Multi-Agent Turn Arbiter",
   description:
-    "Maintains a single active AI speaker per visible message while preserving a raw in-memory transcript for the current conversation epoch.",
+    "Keeps a short visible backlog and lets busy agents finish before catching up from the latest retained visible conversation state.",
 
   register(api: OpenClawPluginApi) {
     const cfg = (api.pluginConfig ?? {}) as ArbiterConfig;
@@ -1018,17 +994,14 @@ export default {
     const enabledChannels = new Set(
       (cfg.enabledChannels ?? []).map((entry) => entry.trim()).filter(Boolean),
     );
-    const leaseMs = typeof cfg.leaseMs === "number" ? Math.max(1000, cfg.leaseMs) : 30000;
     const activeRunLeaseMs =
-      typeof cfg.activeRunLeaseMs === "number" ? Math.max(1000, cfg.activeRunLeaseMs) : 300000;
-    const epochIdleMs =
-      typeof cfg.epochIdleMs === "number" ? Math.max(60000, cfg.epochIdleMs) : 300000;
-    const maxBotHops =
-      cfg.maxBotHops === -1
-        ? -1
-        : typeof cfg.maxBotHops === "number"
-          ? Math.max(1, Math.floor(cfg.maxBotHops))
-          : 16;
+      typeof cfg.activeRunLeaseMs === "number" ? Math.max(1000, cfg.activeRunLeaseMs) : 180000;
+    const reservationLeaseMs =
+      typeof cfg.reservationLeaseMs === "number" ? Math.max(1000, cfg.reservationLeaseMs) : 10000;
+    const postSendGraceMs =
+      typeof cfg.postSendGraceMs === "number" ? Math.max(1000, cfg.postSendGraceMs) : 15000;
+    const stateIdleMs =
+      typeof cfg.stateIdleMs === "number" ? Math.max(1000, cfg.stateIdleMs) : 300000;
     const maxBacklogTurns =
       cfg.maxBacklogTurns === -1
         ? -1
@@ -1041,14 +1014,8 @@ export default {
         : typeof cfg.maxPromptChars === "number"
           ? Math.max(4000, Math.floor(cfg.maxPromptChars))
           : 30000;
-    const settleMs = typeof cfg.settleMs === "number" ? Math.max(250, cfg.settleMs) : 10000;
-    const botReopenCooldownMs =
-      typeof cfg.botReopenCooldownMs === "number"
-        ? Math.max(0, Math.floor(cfg.botReopenCooldownMs))
-        : 30000;
     const failOpen = cfg.failOpen !== false;
     const debug = cfg.debug === true;
-    const claimRecheckGraceMs = 250;
 
     if (!enabled) {
       return;
@@ -1072,20 +1039,45 @@ export default {
       managedAgentBySenderKey.set(`${channelId}:${normalizedSenderId}`, normalizedAgentId);
     };
 
+    const rememberManagedSenderFromMetadata = (
+      channelId: string,
+      metadata: Record<string, unknown> | undefined,
+      agentId?: string,
+    ): void => {
+      const senderId = resolveInboundSenderKey(metadata);
+      if (!senderId) {
+        return;
+      }
+
+      const directAgentId = trimString(agentId) || trimString(metadata?.["agentId"]);
+      if (directAgentId && agentLabelById.has(directAgentId)) {
+        rememberManagedSender(channelId, senderId, directAgentId);
+        return;
+      }
+
+      const managedAccountId = getMetadataString(metadata, [
+        "senderManagedAccountId",
+        "sender_managed_account_id",
+        "senderAccountId",
+        "sender_account_id",
+        "accountId",
+        "account_id",
+      ]);
+      if (!managedAccountId) {
+        return;
+      }
+
+      const mappedAgentId = agentByAccount.get(managedAccountId);
+      if (mappedAgentId) {
+        rememberManagedSender(channelId, senderId, mappedAgentId);
+      }
+    };
+
     const resolveInboundManagedAgentId = (
       channelId: string,
       metadata?: Record<string, unknown>,
     ): string | undefined => {
-      const senderId = getMetadataString(metadata, [
-        "senderId",
-        "sender_id",
-        "authorId",
-        "author_id",
-        "userId",
-        "user_id",
-        "fromId",
-        "from_id",
-      ]);
+      const senderId = resolveInboundSenderKey(metadata);
       if (senderId) {
         const cached = managedAgentBySenderKey.get(`${channelId}:${senderId}`);
         if (cached) {
@@ -1118,285 +1110,193 @@ export default {
       return undefined;
     };
 
-    const rememberDeferredBatonForBusyAgent = (params: {
-      conversationKey: string;
-      channelId: string;
-      conversationId: string;
-      agentId: string;
-      sourceMessageId: string;
-      sessionKey?: string;
-      sessionId?: string;
-    }): void => {
-      rememberDeferredBaton(params);
-      logDebug(
-        api,
-        debug,
-        `deferred baton for ${params.agentId} in ${params.conversationKey}; source=${params.sourceMessageId}`,
-      );
+    const resolvePromptState = (
+      conversationKey: string,
+      agentId: string,
+    ): {
+      visibleMessages: VisibleMessage[];
+      latestVisible?: VisibleMessage;
+      focusMessage?: VisibleMessage;
+      deferredWake?: DeferredWakeRecord;
+    } => {
+      const visibleMessages = getConversationVisibleMessages(conversationKey, stateIdleMs);
+      const latestVisible =
+        getLatestVisibleForConversation(conversationKey, stateIdleMs) ?? visibleMessages.at(-1);
+      const deferredWake = getDeferredWake(conversationKey, agentId, stateIdleMs);
+      let focusMessage: VisibleMessage | undefined;
+      if (deferredWake) {
+        focusMessage =
+          visibleMessages.find((message) => message.messageId === deferredWake.sourceMessageId) ??
+          (latestVisible?.messageId === deferredWake.sourceMessageId ? latestVisible : undefined);
+      }
+      if (!focusMessage) {
+        focusMessage = latestVisible;
+      }
+      return {
+        visibleMessages,
+        latestVisible,
+        focusMessage,
+        deferredWake,
+      };
     };
 
-    const maybeLaunchDeferredBatonsForConversation = async (
+    const maybeLaunchDeferredWake = async (
+      conversationKey: string,
+      agentId: string,
+    ): Promise<void> => {
+      const deferredWake = getDeferredWake(conversationKey, agentId, stateIdleMs);
+      if (!deferredWake) {
+        return;
+      }
+      if (getActiveRun(conversationKey, agentId, activeRunLeaseMs)) {
+        return;
+      }
+
+      const visibleMessages = getConversationVisibleMessages(conversationKey, stateIdleMs);
+      const latestVisible =
+        getLatestVisibleForConversation(conversationKey, stateIdleMs) ?? visibleMessages.at(-1);
+      const pendingSourceMessageId = buildPendingSourceMessageId(conversationKey);
+      const bootstrapLock = getBootstrapLock(
+        conversationKey,
+        reservationLeaseMs,
+        activeRunLeaseMs,
+      );
+      const latestVisibleSenderActive =
+        latestVisible?.kind === "agent" &&
+        latestVisible.senderAgentId &&
+        latestVisible.senderAgentId !== agentId
+          ? getActiveRun(conversationKey, latestVisible.senderAgentId, activeRunLeaseMs)
+          : undefined;
+      if (latestVisibleSenderActive) {
+        return;
+      }
+      const focusMessage =
+        visibleMessages.find((message) => message.messageId === deferredWake.sourceMessageId) ??
+        (latestVisible?.messageId === deferredWake.sourceMessageId ? latestVisible : undefined) ??
+        latestVisible;
+
+      if (!focusMessage && bootstrapLock && bootstrapLock.agentId !== agentId) {
+        return;
+      }
+
+      if (!focusMessage && deferredWake.sourceMessageId !== pendingSourceMessageId) {
+        clearDeferredWake(conversationKey, agentId);
+        return;
+      }
+
+      if (focusMessage) {
+        const eligibleAgents = getEligibleAgentsForVisibleMessage(
+          focusMessage,
+          deferredWake.channelId,
+          agentAccounts,
+        );
+        if (!eligibleAgents.includes(agentId)) {
+          clearDeferredWake(conversationKey, agentId);
+          return;
+        }
+      }
+
+      const sessionKey =
+        trimString(deferredWake.sessionKey) || buildDerivedSessionKey(agentId, conversationKey);
+      const sessionId = trimString(deferredWake.sessionId) || undefined;
+      clearDeferredWake(conversationKey, agentId);
+
+      try {
+        await api.runtime.subagent.run({
+          sessionKey,
+          message: "Internal baton wake.",
+          extraSystemPrompt: [
+            "This is an internal baton wake signal.",
+            "Ignore the literal incoming user text.",
+            "Reply only from the visible baton conversation context added by the plugin.",
+            "If you decide not to add a reply, output only NO_REPLY.",
+          ].join("\n"),
+          deliver: true,
+          idempotencyKey: `deferred-baton:${conversationKey}:${agentId}:${focusMessage?.messageId || pendingSourceMessageId}`,
+        });
+        logDebug(
+          api,
+          debug,
+          `launched deferred wake for ${agentId} in ${conversationKey}; source=${focusMessage?.messageId || pendingSourceMessageId}`,
+        );
+      } catch (err) {
+        rememberDeferredWake({
+          conversationKey,
+          channelId: deferredWake.channelId,
+          conversationId: deferredWake.conversationId,
+          agentId,
+          sourceMessageId: focusMessage?.messageId || pendingSourceMessageId,
+          sessionKey,
+          sessionId,
+        });
+        api.logger.warn?.(
+          `multi-agent-turn-arbiter: failed to launch deferred wake for ${agentId} (${String(err)})`,
+        );
+      }
+    };
+
+    const maybeLaunchDeferredWakesForConversation = async (
       conversationKey: string,
     ): Promise<void> => {
-      const existingEpoch = epochsByConversation.get(conversationKey);
-      if (existingEpoch?.claim) {
-        return;
-      }
-
-      const conversationVisibleMessages = getConversationVisibleMessages(conversationKey, epochIdleMs);
-      const latestVisible = getLatestVisibleForConversation(conversationKey, epochIdleMs);
-      if (conversationVisibleMessages.length === 0 && !latestVisible) {
-        return;
-      }
-
-      const messageIndexById = new Map(
-        conversationVisibleMessages.map((message, index) => [message.messageId, index]),
-      );
-      const deferredEntries = [...deferredBatonsByConversationAgent.values()]
-        .filter((entry) => entry.conversationKey === conversationKey)
-        .map((entry) => {
-          const resolvedSourceMessage =
-            conversationVisibleMessages.find((message) => message.messageId === entry.sourceMessageId) ??
-            latestVisible;
-          const resolvedSourceIndex = resolvedSourceMessage
-            ? (messageIndexById.get(resolvedSourceMessage.messageId) ?? Number.MAX_SAFE_INTEGER)
-            : -1;
-          return {
-            entry,
-            resolvedSourceMessage,
-            resolvedSourceIndex,
-          };
-        })
+      const visibleMessages = getConversationVisibleMessages(conversationKey, stateIdleMs);
+      const latestVisible =
+        getLatestVisibleForConversation(conversationKey, stateIdleMs) ?? visibleMessages.at(-1);
+      const deferredWakes = [...deferredWakesByConversationAgent.values()]
+        .filter((deferredWake) => deferredWake.conversationKey === conversationKey)
         .sort((left, right) => {
-          if (right.resolvedSourceIndex !== left.resolvedSourceIndex) {
-            return right.resolvedSourceIndex - left.resolvedSourceIndex;
-          }
-          if (right.entry.updatedAt !== left.entry.updatedAt) {
-            return right.entry.updatedAt - left.entry.updatedAt;
-          }
-          return right.entry.enqueuedAt - left.entry.enqueuedAt;
+          const leftMessage =
+            visibleMessages.find((message) => message.messageId === left.sourceMessageId) ??
+            (latestVisible?.messageId === left.sourceMessageId ? latestVisible : undefined);
+          const rightMessage =
+            visibleMessages.find((message) => message.messageId === right.sourceMessageId) ??
+            (latestVisible?.messageId === right.sourceMessageId ? latestVisible : undefined);
+          const leftTimestamp = leftMessage?.timestamp ?? left.updatedAt;
+          const rightTimestamp = rightMessage?.timestamp ?? right.updatedAt;
+          return rightTimestamp - leftTimestamp || right.updatedAt - left.updatedAt;
         });
 
-      for (const deferredEntry of deferredEntries) {
-        const deferredBaton = deferredEntry.entry;
-        const agentId = deferredBaton.agentId;
-        if (getActiveTurn(conversationKey, agentId, leaseMs, activeRunLeaseMs)) {
-          continue;
-        }
-
-        const sourceMessage = deferredEntry.resolvedSourceMessage;
-        if (!sourceMessage) {
-          clearDeferredBaton(conversationKey, agentId);
-          continue;
-        }
-
-        const targetAgents = getAllChannelAgents(deferredBaton.channelId, agentAccounts, {
-          excludeAgentId: sourceMessage.kind === "agent" ? sourceMessage.senderAgentId : undefined,
-        });
-        if (!targetAgents.includes(agentId)) {
-          clearDeferredBaton(conversationKey, agentId);
-          continue;
-        }
-
-        clearSettleTimer(conversationKey);
-        const epoch = makeEpoch({
-          conversationKey,
-          channelId: deferredBaton.channelId,
-          conversationId: deferredBaton.conversationId,
-          rootMessage: sourceMessage,
-          targetAgents,
-        });
-        const sessionKey =
-          trimString(deferredBaton.sessionKey) || buildDerivedSessionKey(agentId, conversationKey);
-        const sessionId = trimString(deferredBaton.sessionId) || undefined;
-        const claimedAt = nowMs();
-        epoch.claim = {
-          agentId,
-          sourceMessageId: sourceMessage.messageId,
-          claimedAt,
-          lastActivityAt: claimedAt,
-          sessionKey,
-          sessionId,
-          observedMessageCount: 0,
-          observedMessageIds: [],
-        };
-        epochsByConversation.set(conversationKey, epoch);
-        rememberActiveTurn({
-          conversationKey,
-          agentId,
-          sourceMessageId: sourceMessage.messageId,
-          claimedAt,
-          sessionKey,
-          sessionId,
-        });
-        clearDeferredBaton(conversationKey, agentId);
-
-        try {
-          await api.runtime.subagent.run({
-            sessionKey,
-            message: "Internal baton wake.",
-            extraSystemPrompt: [
-              "This is an internal baton wake signal.",
-              "Ignore the literal incoming user text.",
-              "Reply only from the baton conversation context already added by the plugin.",
-              "If you decide not to add a reply, output only NO_REPLY.",
-            ].join("\n"),
-            deliver: true,
-            idempotencyKey: `deferred-baton:${conversationKey}:${agentId}:${sourceMessage.messageId}`,
-          });
-          logDebug(
-            api,
-            debug,
-            `launched deferred baton for ${agentId} in ${conversationKey}; source=${sourceMessage.messageId}`,
-          );
-        } catch (err) {
-          clearActiveTurn(conversationKey, agentId);
-          rememberDeferredBatonForBusyAgent({
-            conversationKey,
-            channelId: deferredBaton.channelId,
-            conversationId: deferredBaton.conversationId,
-            agentId,
-            sourceMessageId: sourceMessage.messageId,
-            sessionKey,
-            sessionId,
-          });
-          api.logger.warn?.(
-            `multi-agent-turn-arbiter: failed to launch deferred baton for ${agentId} (${String(err)})`,
-          );
-        }
-        return;
+      for (const deferredWake of deferredWakes) {
+        await maybeLaunchDeferredWake(conversationKey, deferredWake.agentId);
       }
     };
 
-    const scheduleClaimFinalize = (
-      conversationKey: string,
-      expectedEpochId: string,
-      expectedClaimedAt: number,
-    ): void => {
-      clearSettleTimer(conversationKey);
-      const timer = setTimeout(() => {
-        settleTimersByConversation.delete(conversationKey);
-
-        const epoch = epochsByConversation.get(conversationKey);
-        if (!epoch || epoch.epochId !== expectedEpochId) {
-          return;
-        }
-
-        maybeExpireClaim(epoch, leaseMs, activeRunLeaseMs);
-
-        const claim = epoch.claim;
-        if (!claim || claim.claimedAt !== expectedClaimedAt || !claim.sendCompletedAt) {
-          return;
-        }
-
-        const now = nowMs();
-        const expectedTextNormalized = claim.expectedTextNormalized ?? "";
-        const observedTextNormalized = claim.observedTextNormalized ?? "";
-        const waitingForInitialVisibility = claim.observedMessageCount <= 0;
-        const waitingForVisiblePrefix =
-          Boolean(expectedTextNormalized) &&
-          (!observedTextNormalized ||
-            (expectedTextNormalized.startsWith(observedTextNormalized) &&
-              expectedTextNormalized !== observedTextNormalized));
-        if ((waitingForInitialVisibility || waitingForVisiblePrefix) && now - claim.sendCompletedAt < leaseMs) {
-          scheduleClaimFinalize(conversationKey, expectedEpochId, expectedClaimedAt);
-          return;
-        }
-
-        const settledAt = Math.max(claim.sendCompletedAt, claim.lastVisibleAt ?? 0);
-        if (now - settledAt < settleMs) {
-          scheduleClaimFinalize(conversationKey, expectedEpochId, expectedClaimedAt);
-          return;
-        }
-
-        const observedMessageCount = claim.observedMessageCount;
-        const visibleMessageCount = epoch.visibleMessages.length;
-        const releasedAgentId = claim.agentId;
-        clearClaim(epoch);
-
-        let shouldPersistEpoch = true;
-
-        if (observedMessageCount > 0) {
-          epoch.hopCount += 1;
-          if (maxBotHops !== -1 && epoch.hopCount >= maxBotHops) {
-            shouldPersistEpoch = false;
-            deleteEpoch(conversationKey);
-          } else {
-            epoch.updatedAt = nowMs();
-          }
-          logDebug(
-            api,
-            debug,
-            `finalized claim for ${conversationKey}; messages=${observedMessageCount} textComplete=${expectedTextNormalized === observedTextNormalized} hops=${epoch.hopCount}`,
-          );
-        } else {
-          if (visibleMessageCount === 0) {
-            shouldPersistEpoch = false;
-            deleteEpoch(conversationKey);
-          } else {
-            epoch.updatedAt = nowMs();
-          }
-          logDebug(
-            api,
-            debug,
-            `cleared claim for ${conversationKey} after send without visible confirmation`,
-          );
-        }
-
-        if (shouldPersistEpoch) {
-          epochsByConversation.set(conversationKey, epoch);
-        }
-        clearActiveTurn(conversationKey, releasedAgentId);
-        void maybeLaunchDeferredBatonsForConversation(conversationKey);
-      }, settleMs);
-      settleTimersByConversation.set(conversationKey, timer);
-    };
-
-    const maybeWaitForSettlingClaimRelease = async (
-      conversationKey: string,
-      epoch: EpochRecord,
-      latest: VisibleMessage | undefined,
-      waitingAgentId: string,
-    ): Promise<EpochRecord | undefined> => {
-      const claim = epoch.claim;
-      if (!claim || claim.agentId === waitingAgentId || !claim.sendCompletedAt) {
-        return undefined;
-      }
-      if (!latest || latest.kind !== "agent" || latest.senderAgentId !== claim.agentId) {
-        return undefined;
-      }
-
-      const settledAt = Math.max(claim.sendCompletedAt, claim.lastVisibleAt ?? 0);
-      const deadline = settledAt + settleMs + claimRecheckGraceMs;
-      const waitMs = deadline - nowMs();
-      if (waitMs <= 0) {
-        cleanupEpochs(epochIdleMs, leaseMs, activeRunLeaseMs);
-        return epochsByConversation.get(conversationKey) ?? epoch;
-      }
-
-      logDebug(
-        api,
-        debug,
-        `waiting ${waitMs}ms for settling claim in ${conversationKey}; owner=${claim.agentId} waiter=${waitingAgentId}`,
+    const cleanupAndMaybeLaunchConversation = async (
+      conversationKey: string | null | undefined,
+    ): Promise<void> => {
+      const conversationsToWake = cleanupState(
+        stateIdleMs,
+        reservationLeaseMs,
+        activeRunLeaseMs,
+        postSendGraceMs,
       );
-      await sleepMs(waitMs);
-      cleanupEpochs(epochIdleMs, leaseMs, activeRunLeaseMs);
-      return epochsByConversation.get(conversationKey) ?? epoch;
+      if (conversationKey && conversationsToWake.includes(conversationKey)) {
+        await maybeLaunchDeferredWakesForConversation(conversationKey);
+      }
     };
 
     api.on("message_received", async (event, ctx) => {
+      let currentConversationKey: string | null = null;
+      const cleanupWakeConversations = new Set<string>();
       try {
-        if (!isEnabledForChannel(enabledChannels, ctx.channelId)) {
+        if (!isEnabledForChannel(enabledChannels, trimString(ctx.channelId))) {
           return;
         }
 
-        cleanupEpochs(epochIdleMs, leaseMs, activeRunLeaseMs);
+        for (const conversationKey of cleanupState(
+          stateIdleMs,
+          reservationLeaseMs,
+          activeRunLeaseMs,
+          postSendGraceMs,
+        )) {
+          cleanupWakeConversations.add(conversationKey);
+        }
 
         const conversationKey = resolveInboundConversationKey(
           ctx.channelId,
           ctx.conversationId,
           event.metadata,
         );
+        currentConversationKey = conversationKey;
         if (!conversationKey) {
           return;
         }
@@ -1407,13 +1307,21 @@ export default {
         }
 
         const messageId = resolveMessageId(event);
-        const senderName = getMetadataString(event.metadata, ["senderName", "sender_name", "authorName", "author_name"]) ?? "";
+        const senderName =
+          getMetadataString(event.metadata, [
+            "senderName",
+            "sender_name",
+            "authorName",
+            "author_name",
+          ]) ?? "";
+        const senderKey = resolveInboundSenderKey(event.metadata);
         const senderAgentId = resolveInboundManagedAgentId(ctx.channelId, event.metadata);
         const kind: "external" | "agent" = senderAgentId ? "agent" : "external";
         const visibleMessage = makeVisibleMessage({
           messageId,
           kind,
           content: event.content,
+          senderKey,
           senderName: senderName || undefined,
           senderAgentId,
           timestamp: event.timestamp,
@@ -1426,339 +1334,86 @@ export default {
 
         setLatestVisible(conversationKey, visibleMessage);
         appendConversationVisibleMessage(conversationKey, visibleMessage, maxBacklogTurns);
-        const pendingAllowanceForLatest = getActivePendingAllowance(
-          conversationKey,
-          leaseMs,
-          activeRunLeaseMs,
-        );
-        if (
-          pendingAllowanceForLatest &&
-          (!senderAgentId || senderAgentId !== pendingAllowanceForLatest.agentId)
-        ) {
-          pendingAllowanceForLatest.sourceMessageId = visibleMessage.messageId;
-          touchPendingAllowance(pendingAllowanceForLatest);
-          pendingAllowancesByConversation.set(conversationKey, pendingAllowanceForLatest);
-        }
 
-        const existing = epochsByConversation.get(conversationKey);
-        if (senderAgentId) {
-          const senderDeferredBaton = getDeferredBaton(
+        const sendLock = getSendLock(conversationKey, activeRunLeaseMs);
+        const senderActiveRun = senderAgentId
+          ? getActiveRun(conversationKey, senderAgentId, activeRunLeaseMs)
+          : undefined;
+        if (senderAgentId && sendLock?.agentId === senderAgentId && senderActiveRun) {
+          setSendLock({
             conversationKey,
-            senderAgentId,
-            epochIdleMs,
-          );
-          const senderClaimSourceMessageId =
-            trimString(existing?.claim?.agentId) === senderAgentId
-              ? trimString(existing?.claim?.sourceMessageId)
-              : "";
-          if (
-            senderDeferredBaton &&
-            senderDeferredBaton.sourceMessageId &&
-            senderDeferredBaton.sourceMessageId !== senderClaimSourceMessageId
-          ) {
-            logDebug(
-              api,
-              debug,
-              `preserved deferred baton for ${senderAgentId} in ${conversationKey}; deferred=${senderDeferredBaton.sourceMessageId} active=${senderClaimSourceMessageId || "none"}`,
-            );
-          } else {
-            clearDeferredBaton(conversationKey, senderAgentId);
-          }
-        }
-        const existingVisibleMessage = existing?.visibleMessages.find((entry) => entry.messageId === messageId);
-        if (existing && existingVisibleMessage) {
-          const unchanged = isSameVisibleMessage(existingVisibleMessage, visibleMessage);
-          appendVisibleMessage(existing, visibleMessage);
-          if (kind === "agent" && senderAgentId && existing.claim?.agentId === senderAgentId) {
-            const claim = existing.claim;
-            claim.lastVisibleAt = nowMs();
-            touchClaim(claim);
-            clearBotReopenGuard(conversationKey);
-            claim.observedMessageIds = uniqueStrings([...(claim.observedMessageIds ?? []), messageId]);
-            recomputeClaimObservedText(existing, claim);
-            if (!claim.sendCompletedAt) {
-              claim.sendCompletedAt = claim.lastVisibleAt;
-              existing.updatedAt = claim.sendCompletedAt;
-              logDebug(
-                api,
-                debug,
-                `inferred send completion from visible message ${messageId} for ${conversationKey}`,
-              );
-            }
-            scheduleClaimFinalize(conversationKey, existing.epochId, claim.claimedAt);
-          }
-          existing.updatedAt = nowMs();
-          epochsByConversation.set(conversationKey, existing);
-          logDebug(
-            api,
-            debug,
-            `${unchanged ? "reused" : "refreshed"} existing visible message ${messageId} for ${conversationKey}`,
-          );
-          return;
+            agentId: senderAgentId,
+            sourceMessageId: sendLock.sourceMessageId,
+            sessionKey: sendLock.sessionKey,
+            sessionId: sendLock.sessionId,
+          });
         }
 
-        if (kind === "external") {
-          const existingLatest = existing ? getLatestVisible(existing) : undefined;
-          if (
-            existing &&
-            existingLatest?.kind === "external" &&
-            trimString(existingLatest.content) === trimString(event.content)
-          ) {
-            existing.updatedAt = nowMs();
-            epochsByConversation.set(conversationKey, existing);
-            logDebug(api, debug, `reused existing external epoch ${existing.epochId} for ${conversationKey}`);
-            return;
+        const eligibleAgents = getEligibleAgentsForVisibleMessage(
+          visibleMessage,
+          ctx.channelId,
+          agentAccounts,
+        );
+        for (const targetAgentId of eligibleAgents) {
+          const activeRun = getActiveRun(conversationKey, targetAgentId, activeRunLeaseMs);
+          if (!activeRun && (!senderActiveRun || targetAgentId === senderAgentId)) {
+            continue;
           }
-
-          const targetAgents = inferTargetAgents(event.content, ctx.channelId, agentAccounts);
-          if (targetAgents.length === 0) {
-            clearSettleTimer(conversationKey);
-            epochsByConversation.delete(conversationKey);
-            return;
-          }
-          const immediateTargetAgents: string[] = [];
-          for (const targetAgentId of targetAgents) {
-            const activeTurn = getActiveTurn(
-              conversationKey,
-              targetAgentId,
-              leaseMs,
-              activeRunLeaseMs,
-            );
-            if (!activeTurn) {
-              immediateTargetAgents.push(targetAgentId);
-              continue;
-            }
-            rememberDeferredBatonForBusyAgent({
-              conversationKey,
-              channelId: ctx.channelId,
-              conversationId,
-              agentId: targetAgentId,
-              sourceMessageId: visibleMessage.messageId,
-              sessionKey: activeTurn.sessionKey || buildDerivedSessionKey(targetAgentId, conversationKey),
-              sessionId: activeTurn.sessionId,
-            });
-          }
-          if (immediateTargetAgents.length === 0) {
-            clearSettleTimer(conversationKey);
-            deleteEpoch(conversationKey);
-            return;
-          }
-          clearSettleTimer(conversationKey);
-          const epoch = makeEpoch({
+          rememberDeferredWake({
             conversationKey,
             channelId: ctx.channelId,
             conversationId,
-            rootMessage: visibleMessage,
-            targetAgents: immediateTargetAgents,
+            agentId: targetAgentId,
+            sourceMessageId: visibleMessage.messageId,
+            sessionKey: activeRun?.sessionKey || buildDerivedSessionKey(targetAgentId, conversationKey),
+            sessionId: activeRun?.sessionId,
           });
-          const pendingAllowance = getActivePendingAllowance(
-            conversationKey,
-            leaseMs,
-            activeRunLeaseMs,
-          );
-          if (pendingAllowance && epoch.targetAgents.includes(pendingAllowance.agentId)) {
-            epoch.claim = makeClaimFromPendingAllowance(pendingAllowance, visibleMessage.messageId);
-          }
-          clearPendingAllowance(conversationKey);
-          setBotReopenGuard(conversationKey, visibleMessage.messageId, botReopenCooldownMs);
-          epochsByConversation.set(conversationKey, epoch);
           logDebug(
             api,
             debug,
-            `opened epoch ${epoch.epochId} targets=${epoch.targetAgents.join(",") || "none"}`,
+            `deferred latest visible ${visibleMessage.messageId} for busy ${targetAgentId} in ${conversationKey}`,
           );
-          return;
         }
 
         if (!senderAgentId) {
           return;
         }
 
-        const epoch = epochsByConversation.get(conversationKey);
-        const botReopenGuard = getActiveBotReopenGuard(conversationKey);
-        if (!epoch) {
-          if (botReopenGuard) {
-            logDebug(
-              api,
-              debug,
-              `suppressed agent-root epoch from ${senderAgentId} for ${conversationKey}; guard source=${botReopenGuard.sourceMessageId}`,
-            );
-            return;
-          }
-          const targetAgents = getAllChannelAgents(ctx.channelId, agentAccounts, {
-            excludeAgentId: senderAgentId,
-          });
-          if (targetAgents.length === 0) {
-            clearSettleTimer(conversationKey);
-            epochsByConversation.delete(conversationKey);
-            return;
-          }
-          const immediateTargetAgents: string[] = [];
-          for (const targetAgentId of targetAgents) {
-            const activeTurn = getActiveTurn(
-              conversationKey,
-              targetAgentId,
-              leaseMs,
-              activeRunLeaseMs,
-            );
-            if (!activeTurn) {
-              immediateTargetAgents.push(targetAgentId);
-              continue;
-            }
-            rememberDeferredBatonForBusyAgent({
-              conversationKey,
-              channelId: ctx.channelId,
-              conversationId,
-              agentId: targetAgentId,
-              sourceMessageId: visibleMessage.messageId,
-              sessionKey: activeTurn.sessionKey || buildDerivedSessionKey(targetAgentId, conversationKey),
-              sessionId: activeTurn.sessionId,
-            });
-          }
-          if (immediateTargetAgents.length === 0) {
-            clearSettleTimer(conversationKey);
-            deleteEpoch(conversationKey);
-            return;
-          }
-          clearSettleTimer(conversationKey);
-          const nextEpoch = makeEpoch({
+        if (senderActiveRun) {
+          clearPostSendGrace(
             conversationKey,
-            channelId: ctx.channelId,
-            conversationId,
-            rootMessage: visibleMessage,
-            targetAgents: immediateTargetAgents,
-          });
-          const pendingAllowance = getActivePendingAllowance(
+            senderAgentId,
+            senderActiveRun.sourceMessageId,
+          );
+          rememberActiveRun({
             conversationKey,
-            leaseMs,
-            activeRunLeaseMs,
-          );
-          if (pendingAllowance && nextEpoch.targetAgents.includes(pendingAllowance.agentId)) {
-            nextEpoch.claim = makeClaimFromPendingAllowance(pendingAllowance, visibleMessage.messageId);
-          }
-          clearPendingAllowance(conversationKey);
-          setBotReopenGuard(conversationKey, visibleMessage.messageId, botReopenCooldownMs);
-          epochsByConversation.set(conversationKey, nextEpoch);
-          logDebug(
-            api,
-            debug,
-            `opened agent-root epoch ${nextEpoch.epochId} from ${senderAgentId}; targets=${targetAgents.join(",") || "none"}`,
-          );
+            channelId: senderActiveRun.channelId,
+            conversationId: senderActiveRun.conversationId,
+            agentId: senderAgentId,
+            sourceMessageId: senderActiveRun.sourceMessageId,
+            sessionKey: senderActiveRun.sessionKey,
+            sessionId: senderActiveRun.sessionId,
+            runId: senderActiveRun.runId,
+          });
           return;
         }
 
-        maybeExpireClaim(epoch, leaseMs, activeRunLeaseMs);
+        clearPostSendGrace(conversationKey, senderAgentId);
+        clearActiveRun(conversationKey, senderAgentId);
+        clearSendLockForAgent(conversationKey, senderAgentId);
 
-        const claim = epoch.claim;
-        if (!claim) {
-          if (botReopenGuard) {
-            logDebug(
-              api,
-              debug,
-              `suppressed stale agent visible message ${messageId} from ${senderAgentId} during reopen guard for ${conversationKey}`,
-            );
-            return;
-          }
-          const targetAgents = getAllChannelAgents(ctx.channelId, agentAccounts, {
-            excludeAgentId: senderAgentId,
-          });
-          if (targetAgents.length === 0) {
-            clearSettleTimer(conversationKey);
-            epochsByConversation.delete(conversationKey);
-            return;
-          }
-          const immediateTargetAgents: string[] = [];
-          for (const targetAgentId of targetAgents) {
-            const activeTurn = getActiveTurn(
-              conversationKey,
-              targetAgentId,
-              leaseMs,
-              activeRunLeaseMs,
-            );
-            if (!activeTurn) {
-              immediateTargetAgents.push(targetAgentId);
-              continue;
-            }
-            rememberDeferredBatonForBusyAgent({
-              conversationKey,
-              channelId: ctx.channelId,
-              conversationId,
-              agentId: targetAgentId,
-              sourceMessageId: visibleMessage.messageId,
-              sessionKey: activeTurn.sessionKey || buildDerivedSessionKey(targetAgentId, conversationKey),
-              sessionId: activeTurn.sessionId,
-            });
-          }
-          if (immediateTargetAgents.length === 0) {
-            clearSettleTimer(conversationKey);
-            deleteEpoch(conversationKey);
-            return;
-          }
-          clearSettleTimer(conversationKey);
-          const nextEpoch = makeEpoch({
-            conversationKey,
-            channelId: ctx.channelId,
-            conversationId,
-            rootMessage: visibleMessage,
-            targetAgents: immediateTargetAgents,
-          });
-          const pendingAllowance = getActivePendingAllowance(
-            conversationKey,
-            leaseMs,
-            activeRunLeaseMs,
-          );
-          if (pendingAllowance && nextEpoch.targetAgents.includes(pendingAllowance.agentId)) {
-            nextEpoch.claim = makeClaimFromPendingAllowance(pendingAllowance, visibleMessage.messageId);
-          }
-          clearPendingAllowance(conversationKey);
-          setBotReopenGuard(conversationKey, visibleMessage.messageId, botReopenCooldownMs);
-          epochsByConversation.set(conversationKey, nextEpoch);
-          logDebug(
-            api,
-            debug,
-            `reopened epoch ${nextEpoch.epochId} from visible agent ${senderAgentId}; targets=${targetAgents.join(",") || "none"}`,
-          );
-          return;
+        const senderDeferredWake = getDeferredWake(conversationKey, senderAgentId, stateIdleMs);
+        if (senderDeferredWake && senderDeferredWake.sourceMessageId !== visibleMessage.messageId) {
+          await maybeLaunchDeferredWake(conversationKey, senderAgentId);
         }
-        if (claim.agentId !== senderAgentId) {
-          logDebug(
-            api,
-            debug,
-            `ignored stale visible agent message ${messageId} from ${senderAgentId} for ${conversationKey}`,
-          );
-          return;
-        }
-
-        const appended = appendVisibleMessage(epoch, visibleMessage);
-        claim.lastVisibleAt = nowMs();
-        touchClaim(claim);
-        clearBotReopenGuard(conversationKey);
-        claim.observedMessageIds = uniqueStrings([...(claim.observedMessageIds ?? []), messageId]);
-        if (appended) {
-          recomputeClaimObservedText(epoch, claim);
-        } else {
-          recomputeClaimObservedText(epoch, claim);
-        }
-        if (!claim.sendCompletedAt) {
-          claim.sendCompletedAt = claim.lastVisibleAt;
-          epoch.updatedAt = claim.sendCompletedAt;
-          logDebug(
-            api,
-            debug,
-            `inferred send completion from visible message ${messageId} for ${conversationKey}`,
-          );
-        }
-        scheduleClaimFinalize(conversationKey, epoch.epochId, claim.claimedAt);
-        epochsByConversation.set(conversationKey, epoch);
-        logDebug(
-          api,
-          debug,
-          `observed visible agent message ${messageId} from ${senderAgentId}; count=${claim.observedMessageCount} sendComplete=${Boolean(claim.sendCompletedAt)}`,
-        );
       } catch (err) {
         api.logger.warn?.(
           `multi-agent-turn-arbiter: message_received hook failed (${String(err)})`,
         );
+      } finally {
+        if (currentConversationKey && cleanupWakeConversations.has(currentConversationKey)) {
+          await maybeLaunchDeferredWakesForConversation(currentConversationKey);
+        }
       }
     });
 
@@ -1768,8 +1423,6 @@ export default {
           return;
         }
 
-        cleanupEpochs(epochIdleMs, leaseMs, activeRunLeaseMs);
-
         const channelId = trimString(ctx.channelId);
         const sessionKey = trimString(ctx.sessionKey) || undefined;
         const sessionId = trimString(ctx.sessionId) || undefined;
@@ -1778,224 +1431,224 @@ export default {
         if (!conversationKey || !agentId) {
           return;
         }
+        await cleanupAndMaybeLaunchConversation(conversationKey);
 
-        const latestVisibleForConversation = getLatestVisibleForConversation(conversationKey, epochIdleMs);
-        let epoch = epochsByConversation.get(conversationKey);
-        const activeTurn = getActiveTurn(conversationKey, agentId, leaseMs, activeRunLeaseMs);
-        const currentSourceMessageId =
-          trimString(getLatestVisible(epoch)?.messageId) || trimString(latestVisibleForConversation?.messageId);
-        const fallbackConversationId =
-          epoch?.conversationId || conversationKey.slice(`${channelId}:`.length);
+        const promptState = resolvePromptState(conversationKey, agentId);
+        const pendingSourceMessageId = buildPendingSourceMessageId(conversationKey);
+        const activeRun = getActiveRun(conversationKey, agentId, activeRunLeaseMs);
+        const bootstrapLock = getBootstrapLock(
+          conversationKey,
+          reservationLeaseMs,
+          activeRunLeaseMs,
+        );
+        let sourceLock =
+          promptState.focusMessage
+            ? getSourceLock(conversationKey, reservationLeaseMs, activeRunLeaseMs)
+            : undefined;
+        const latestVisibleSenderActive =
+          promptState.latestVisible?.kind === "agent" &&
+          promptState.latestVisible.senderAgentId &&
+          promptState.latestVisible.senderAgentId !== agentId
+            ? getActiveRun(conversationKey, promptState.latestVisible.senderAgentId, activeRunLeaseMs)
+            : undefined;
+
+        if (!promptState.focusMessage) {
+          if (bootstrapLock && bootstrapLock.agentId !== agentId) {
+            rememberDeferredWake({
+              conversationKey,
+              channelId,
+              conversationId:
+                trimString(ctx.conversationId) || conversationKey.slice(`${channelId}:`.length),
+              agentId,
+              sourceMessageId: pendingSourceMessageId,
+              sessionKey: sessionKey || buildDerivedSessionKey(agentId, conversationKey),
+              sessionId,
+            });
+            return denyContext("Another managed agent currently owns the initial conversation turn.");
+          }
+          if (activeRun) {
+            if (activeRun.sourceMessageId === pendingSourceMessageId) {
+              setBootstrapLock({
+                conversationKey,
+                agentId,
+                phase: "active",
+                sessionKey: sessionKey || activeRun.sessionKey,
+                sessionId: sessionId || activeRun.sessionId,
+              });
+            }
+            return denyContext("You already have an active run in this conversation.");
+          }
+          setBootstrapLock({
+            conversationKey,
+            agentId,
+            phase: "reserved",
+            sessionKey: sessionKey || buildDerivedSessionKey(agentId, conversationKey),
+            sessionId,
+          });
+          return buildInitialPromptContext();
+        }
+
+        const eligibleAgents = getEligibleAgentsForVisibleMessage(
+          promptState.focusMessage,
+          channelId,
+          agentAccounts,
+        );
+        if (!eligibleAgents.includes(agentId)) {
+          if (bootstrapLock?.agentId === agentId) {
+            rememberDeferredWake({
+              conversationKey,
+              channelId,
+              conversationId:
+                trimString(ctx.conversationId) || conversationKey.slice(`${channelId}:`.length),
+              agentId,
+              sourceMessageId: pendingSourceMessageId,
+              sessionKey: sessionKey || buildDerivedSessionKey(agentId, conversationKey),
+              sessionId,
+            });
+          } else if (promptState.deferredWake) {
+            clearDeferredWake(conversationKey, agentId);
+          }
+          return denyContext("This visible message is not addressed to you.");
+        }
+
         if (
-          activeTurn &&
-          currentSourceMessageId &&
-          trimString(activeTurn.sourceMessageId) &&
-          currentSourceMessageId !== trimString(activeTurn.sourceMessageId)
+          promptState.latestVisible?.kind === "agent" &&
+          promptState.latestVisible.senderAgentId === agentId &&
+          (!promptState.deferredWake ||
+            promptState.deferredWake.sourceMessageId === promptState.latestVisible.messageId)
         ) {
-          rememberDeferredBatonForBusyAgent({
+          if (bootstrapLock?.agentId === agentId) {
+            rememberDeferredWake({
+              conversationKey,
+              channelId,
+              conversationId:
+                trimString(ctx.conversationId) || conversationKey.slice(`${channelId}:`.length),
+              agentId,
+              sourceMessageId: pendingSourceMessageId,
+              sessionKey: sessionKey || buildDerivedSessionKey(agentId, conversationKey),
+              sessionId,
+            });
+          }
+          return denyContext("You may not reply directly to your own latest visible message.");
+        }
+
+        if (bootstrapLock) {
+          if (bootstrapLock.agentId !== agentId) {
+            rememberDeferredWake({
+              conversationKey,
+              channelId,
+              conversationId:
+                trimString(ctx.conversationId) || conversationKey.slice(`${channelId}:`.length),
+              agentId,
+              sourceMessageId: promptState.focusMessage.messageId,
+              sessionKey: sessionKey || buildDerivedSessionKey(agentId, conversationKey),
+              sessionId,
+            });
+            return denyContext("Another managed agent currently owns the initial conversation turn.");
+          }
+
+          if (!sourceLock || sourceLock.agentId === agentId) {
+            const promotedPhase: LockPhase =
+              bootstrapLock.phase === "active" || !!activeRun ? "active" : "reserved";
+            setSourceLock({
+              conversationKey,
+              agentId,
+              sourceMessageId: promptState.focusMessage.messageId,
+              phase: promotedPhase,
+              sessionKey:
+                sessionKey || bootstrapLock.sessionKey || buildDerivedSessionKey(agentId, conversationKey),
+              sessionId: sessionId || bootstrapLock.sessionId,
+            });
+            clearBootstrapLockForAgent(conversationKey, agentId);
+            sourceLock = getSourceLock(conversationKey, reservationLeaseMs, activeRunLeaseMs);
+          }
+        }
+
+        if (latestVisibleSenderActive && promptState.latestVisible) {
+          rememberDeferredWake({
             conversationKey,
             channelId,
-            conversationId: trimString(ctx.conversationId) || fallbackConversationId,
+            conversationId:
+              trimString(ctx.conversationId) || conversationKey.slice(`${channelId}:`.length),
             agentId,
-            sourceMessageId: currentSourceMessageId,
-            sessionKey: sessionKey || activeTurn.sessionKey || buildDerivedSessionKey(agentId, conversationKey),
-            sessionId: sessionId || activeTurn.sessionId,
+            sourceMessageId: promptState.latestVisible.messageId,
+            sessionKey: sessionKey || buildDerivedSessionKey(agentId, conversationKey),
+            sessionId,
           });
-          return denyContext("You already have an active baton run for an earlier visible message.");
+          return denyContext("Another managed agent is still completing its visible turn.");
         }
 
-        if (!epoch) {
-          const existingAllowance = getActivePendingAllowance(
+        if (
+          promptState.focusMessage &&
+          sourceLock &&
+          sourceLock.sourceMessageId === promptState.focusMessage.messageId &&
+          sourceLock.agentId !== agentId
+        ) {
+          rememberDeferredWake({
             conversationKey,
-            leaseMs,
-            activeRunLeaseMs,
-          );
-          if (existingAllowance && !isSameAllowanceOwner({ allowance: existingAllowance, agentId, sessionKey, sessionId })) {
-            logDebug(
-              api,
-              debug,
-              `yielding ${agentId}; pending allowance for ${conversationKey} owned by ${existingAllowance.agentId}`,
-            );
-            return denyContext("Another targeted agent currently owns the pending baton.");
-          }
-          if (!existingAllowance) {
-            const targetAgents = getAllChannelAgents(channelId, agentAccounts);
-            if (!targetAgents.includes(agentId)) {
-              return;
-            }
-            pendingAllowancesByConversation.set(conversationKey, {
+            channelId,
+            conversationId:
+              trimString(ctx.conversationId) || conversationKey.slice(`${channelId}:`.length),
+            agentId,
+            sourceMessageId: promptState.focusMessage.messageId,
+            sessionKey: sessionKey || buildDerivedSessionKey(agentId, conversationKey),
+            sessionId,
+          });
+          return denyContext("Another managed agent currently owns this visible message.");
+        }
+
+        if (activeRun) {
+          if (
+            promptState.focusMessage &&
+            activeRun.sourceMessageId === promptState.focusMessage.messageId &&
+            (!sourceLock || sourceLock.agentId === agentId)
+          ) {
+            setSourceLock({
+              conversationKey,
               agentId,
-              grantedAt: nowMs(),
-              lastActivityAt: nowMs(),
-              sourceMessageId: latestVisibleForConversation?.messageId,
-              sessionKey,
-              sessionId,
+              sourceMessageId: promptState.focusMessage.messageId,
+              phase: "active",
+              sessionKey: sessionKey || activeRun.sessionKey,
+              sessionId: sessionId || activeRun.sessionId,
             });
-            logDebug(
-              api,
-              debug,
-              `granted pending allowance for ${conversationKey} to ${agentId}`,
-            );
-          } else {
-            if (latestVisibleForConversation?.messageId) {
-              existingAllowance.sourceMessageId = latestVisibleForConversation.messageId;
-            }
-            touchPendingAllowance(existingAllowance);
-            pendingAllowancesByConversation.set(conversationKey, existingAllowance);
           }
-          const conversationVisibleMessages = getConversationVisibleMessages(conversationKey, epochIdleMs);
-          const pendingVisibleMessages =
-            conversationVisibleMessages.length > 0
-              ? conversationVisibleMessages
-              : latestVisibleForConversation
-                ? [latestVisibleForConversation]
-                : [];
-          return buildPendingPromptContext({
-            visibleMessages: pendingVisibleMessages,
-            agentLabelById,
-            maxPromptChars,
+          if (activeRun.sourceMessageId !== promptState.focusMessage.messageId) {
+            rememberDeferredWake({
+              conversationKey,
+              channelId,
+              conversationId:
+                trimString(ctx.conversationId) || conversationKey.slice(`${channelId}:`.length),
+              agentId,
+              sourceMessageId: promptState.focusMessage.messageId,
+              sessionKey: sessionKey || activeRun.sessionKey || buildDerivedSessionKey(agentId, conversationKey),
+              sessionId: sessionId || activeRun.sessionId,
+            });
+            return denyContext("You already have an active run for an earlier visible message.");
+          }
+          return denyContext("You already have an active run for this visible message.");
+        }
+
+        if (promptState.focusMessage) {
+          setSourceLock({
+            conversationKey,
+            agentId,
+            sourceMessageId: promptState.focusMessage.messageId,
+            phase: "reserved",
+            sessionKey: sessionKey || buildDerivedSessionKey(agentId, conversationKey),
+            sessionId,
           });
         }
 
-        let waitedForSettlingClaim = false;
-        while (true) {
-          maybeExpireClaim(epoch, leaseMs, activeRunLeaseMs);
-
-          if (!epoch.targetAgents.includes(agentId)) {
-            return denyContext("This conversation step is not addressed to you.");
-          }
-
-          const latest = getLatestVisible(epoch);
-          if (!latest) {
-            if (epoch.claim && epoch.claim.agentId !== agentId) {
-              logDebug(
-                api,
-                debug,
-                `yielding ${agentId}; pending epoch ${epoch.epochId} owned by ${epoch.claim.agentId}`,
-              );
-              return denyContext("Another targeted agent currently owns the pending baton.");
-            }
-
-            if (!epoch.claim) {
-              const pendingAllowance = getActivePendingAllowance(
-                conversationKey,
-                leaseMs,
-                activeRunLeaseMs,
-              );
-              if (pendingAllowance && !isSameAllowanceOwner({ allowance: pendingAllowance, agentId, sessionKey, sessionId })) {
-                return denyContext("Another targeted agent currently owns the pending baton.");
-              }
-              if (pendingAllowance) {
-                epoch.claim = makeClaimFromPendingAllowance(pendingAllowance, epoch.rootMessageId);
-                clearPendingAllowance(conversationKey);
-              } else {
-                const claimedAt = nowMs();
-                epoch.claim = {
-                  agentId,
-                  sourceMessageId: epoch.rootMessageId,
-                  claimedAt,
-                  lastActivityAt: claimedAt,
-                  sessionKey,
-                  sessionId,
-                  observedMessageCount: 0,
-                  observedMessageIds: [],
-                };
-              }
-              epoch.updatedAt = nowMs();
-              epochsByConversation.set(conversationKey, epoch);
-            }
-
-            return;
-          }
-
-          if (latest.kind === "agent" && latest.senderAgentId === agentId) {
-            return denyContext("You may not respond directly to your own latest visible message.");
-          }
-
-          const eligibleAgents = getEligibleAgents(epoch);
-          if (!eligibleAgents.includes(agentId)) {
-            return denyContext("You are not eligible to answer the current visible message.");
-          }
-
-          if (getDeclinedAgents(epoch, latest.messageId).has(agentId)) {
-            return denyContext("You already declined the current visible message.");
-          }
-
-          if (haveAllEligibleAgentsDeclined(epoch, latest.messageId)) {
-            deleteEpoch(conversationKey);
-            return denyContext("All eligible agents already declined this visible message.");
-          }
-
-          if (epoch.claim && epoch.claim.agentId !== agentId) {
-            if (!waitedForSettlingClaim) {
-              const refreshedEpoch = await maybeWaitForSettlingClaimRelease(
-                conversationKey,
-                epoch,
-                latest,
-                agentId,
-              );
-              if (refreshedEpoch) {
-                epoch = refreshedEpoch;
-                waitedForSettlingClaim = true;
-                continue;
-              }
-            }
-            logDebug(
-              api,
-              debug,
-              `yielding ${agentId}; epoch ${epoch.epochId} owned by ${epoch.claim.agentId}`,
-            );
-            return denyContext("Another targeted agent currently owns this visible message.");
-          }
-
-          if (!epoch.claim) {
-            const claimedAt = nowMs();
-            epoch.claim = {
-              agentId,
-              sourceMessageId: latest.messageId,
-              claimedAt,
-              lastActivityAt: claimedAt,
-              sessionKey,
-              sessionId,
-              observedMessageCount: 0,
-              observedMessageIds: [],
-            };
-            epoch.updatedAt = nowMs();
-            epochsByConversation.set(conversationKey, epoch);
-            logDebug(
-              api,
-              debug,
-              `claimed epoch ${epoch.epochId} by ${agentId} for ${latest.messageId}`,
-            );
-          }
-
-          const conversationVisibleMessages = getConversationVisibleMessages(conversationKey, epochIdleMs);
-          if (!epoch) {
-            const pendingVisibleMessages =
-              conversationVisibleMessages.length > 0
-                ? conversationVisibleMessages
-                : latestVisibleForConversation
-                  ? [latestVisibleForConversation]
-                  : [];
-            return buildPendingPromptContext({
-              visibleMessages: pendingVisibleMessages,
-              agentLabelById,
-              maxPromptChars,
-            });
-          }
-          const prompt = buildPromptContext({
-            epoch,
-            visibleMessages:
-              conversationVisibleMessages.length > 0 ? conversationVisibleMessages : epoch.visibleMessages,
-            agentLabelById,
-            maxPromptChars,
-          });
-          if (!prompt) {
-            return denyContext("No visible message is available for the current baton epoch.");
-          }
-
-          return prompt;
-        }
+        return buildPromptContext({
+          visibleMessages:
+            promptState.visibleMessages.length > 0
+              ? promptState.visibleMessages
+              : [promptState.focusMessage],
+          focusMessage: promptState.focusMessage,
+          latestVisible: promptState.latestVisible,
+          agentLabelById,
+          maxPromptChars,
+        });
       } catch (err) {
         api.logger.warn?.(
           `multi-agent-turn-arbiter: before_prompt_build hook failed (${String(err)})`,
@@ -2009,77 +1662,88 @@ export default {
           return;
         }
 
-        cleanupEpochs(epochIdleMs, leaseMs, activeRunLeaseMs);
-
-        const conversationKey = resolveConversationKeyFromSessionKey(ctx.sessionKey, ctx.channelId);
+        const channelId = trimString(ctx.channelId);
+        const sessionKey = trimString(ctx.sessionKey) || undefined;
+        const sessionId = trimString(ctx.sessionId) || undefined;
+        const conversationKey = resolveConversationKeyFromSessionKey(sessionKey, channelId);
         const agentId = trimString(ctx.agentId);
         if (!conversationKey || !agentId) {
           return;
         }
+        await cleanupAndMaybeLaunchConversation(conversationKey);
 
-        const epoch = epochsByConversation.get(conversationKey);
-        if (!epoch) {
-          const allowance = getActivePendingAllowance(
+        const promptState = resolvePromptState(conversationKey, agentId);
+        const pendingSourceMessageId = buildPendingSourceMessageId(conversationKey);
+        const sourceMessageId =
+          trimString(promptState.deferredWake?.sourceMessageId) ||
+          trimString(promptState.focusMessage?.messageId) ||
+          pendingSourceMessageId;
+        const conversationId =
+          trimString(ctx.conversationId) || conversationKey.slice(`${channelId}:`.length);
+
+        if (sourceMessageId === pendingSourceMessageId) {
+          const bootstrapLock = getBootstrapLock(
             conversationKey,
-            leaseMs,
+            reservationLeaseMs,
             activeRunLeaseMs,
           );
-          if (!allowance || !isSameAllowanceOwner({
-            allowance,
-            agentId,
-            sessionKey: trimString(ctx.sessionKey) || undefined,
-            sessionId: trimString(ctx.sessionId) || undefined,
-          })) {
+          if (!bootstrapLock || bootstrapLock.agentId !== agentId) {
+            logDebug(
+              api,
+              debug,
+              `ignored llm_input for ${agentId}; bootstrap owner is ${bootstrapLock?.agentId ?? "none"} in ${conversationKey}`,
+            );
             return;
           }
-          allowance.runId = event.runId;
-          allowance.approvedOutputTextNormalized = undefined;
-          touchPendingAllowance(allowance);
-          pendingAllowancesByConversation.set(conversationKey, allowance);
-          rememberActiveTurn({
+          setBootstrapLock({
             conversationKey,
             agentId,
-            sourceMessageId: allowance.sourceMessageId,
-            claimedAt: allowance.grantedAt,
-            sessionKey: allowance.sessionKey || trimString(ctx.sessionKey) || buildDerivedSessionKey(agentId, conversationKey),
-            sessionId: allowance.sessionId || trimString(ctx.sessionId) || undefined,
-            runId: event.runId,
+            phase: "active",
+            sessionKey: sessionKey || buildDerivedSessionKey(agentId, conversationKey),
+            sessionId,
           });
-          return;
+        } else {
+          const sourceLock = getSourceLock(
+            conversationKey,
+            reservationLeaseMs,
+            activeRunLeaseMs,
+          );
+          if (
+            !sourceLock ||
+            sourceLock.sourceMessageId !== sourceMessageId ||
+            sourceLock.agentId !== agentId
+          ) {
+            logDebug(
+              api,
+              debug,
+              `ignored llm_input for ${agentId}; source=${sourceMessageId} owner=${sourceLock?.agentId ?? "none"} lockSource=${sourceLock?.sourceMessageId ?? "none"} in ${conversationKey}`,
+            );
+            return;
+          }
+          setSourceLock({
+            conversationKey,
+            agentId,
+            sourceMessageId,
+            phase: "active",
+            sessionKey: sessionKey || buildDerivedSessionKey(agentId, conversationKey),
+            sessionId,
+          });
         }
-
-        maybeExpireClaim(epoch, leaseMs, activeRunLeaseMs);
-
-        const claim = epoch.claim;
-        if (!claim || claim.agentId !== agentId) {
-          return;
-        }
-
-        if (claim.sessionKey && ctx.sessionKey && claim.sessionKey !== ctx.sessionKey) {
-          return;
-        }
-        if (claim.sessionId && ctx.sessionId && claim.sessionId !== ctx.sessionId) {
-          return;
-        }
-
-        claim.runId = event.runId;
-        claim.approvedOutputTextNormalized = undefined;
-        touchClaim(claim);
-        epoch.updatedAt = nowMs();
-        epochsByConversation.set(conversationKey, epoch);
-        rememberActiveTurn({
+        rememberActiveRun({
           conversationKey,
+          channelId,
+          conversationId,
           agentId,
-          sourceMessageId: claim.sourceMessageId,
-          claimedAt: claim.claimedAt,
-          sessionKey: claim.sessionKey || trimString(ctx.sessionKey) || buildDerivedSessionKey(agentId, conversationKey),
-          sessionId: claim.sessionId || trimString(ctx.sessionId) || undefined,
+          sourceMessageId,
+          sessionKey: sessionKey || buildDerivedSessionKey(agentId, conversationKey),
+          sessionId,
           runId: event.runId,
         });
+        if (promptState.deferredWake?.sourceMessageId === sourceMessageId) {
+          clearDeferredWake(conversationKey, agentId);
+        }
       } catch (err) {
-        api.logger.warn?.(
-          `multi-agent-turn-arbiter: llm_input hook failed (${String(err)})`,
-        );
+        api.logger.warn?.(`multi-agent-turn-arbiter: llm_input hook failed (${String(err)})`);
       }
     });
 
@@ -2089,111 +1753,51 @@ export default {
           return;
         }
 
-        cleanupEpochs(epochIdleMs, leaseMs, activeRunLeaseMs);
-
         const conversationKey = resolveConversationKeyFromSessionKey(ctx.sessionKey, ctx.channelId);
         const agentId = trimString(ctx.agentId);
         if (!conversationKey || !agentId) {
           return;
         }
+        await cleanupAndMaybeLaunchConversation(conversationKey);
 
-        const epoch = epochsByConversation.get(conversationKey);
-        if (!epoch) {
-          const allowance = getActivePendingAllowance(
-            conversationKey,
-            leaseMs,
-            activeRunLeaseMs,
-          );
-          if (!allowance || !isSameAllowanceOwner({
-            allowance,
-            agentId,
-            sessionKey: trimString(ctx.sessionKey) || undefined,
-            sessionId: trimString(ctx.sessionId) || undefined,
-          })) {
-            return;
-          }
-          if (!allowance.runId || event.runId !== allowance.runId) {
-            return;
-          }
-          if (!isOnlyNoReplyOutput(event.assistantTexts)) {
-            const approvedOutputTextNormalized = normalizeComparableText(event.assistantTexts.join("\n\n"));
-            if (approvedOutputTextNormalized) {
-              allowance.approvedOutputTextNormalized = approvedOutputTextNormalized;
-              touchPendingAllowance(allowance);
-              pendingAllowancesByConversation.set(conversationKey, allowance);
-            }
-            return;
-          }
-          clearPendingAllowance(conversationKey);
-          clearActiveTurn(conversationKey, agentId);
-          void maybeLaunchDeferredBatonsForConversation(conversationKey);
+        const activeRun = getActiveRun(conversationKey, agentId, activeRunLeaseMs);
+        if (!activeRun) {
+          return;
+        }
+        if (activeRun.runId && activeRun.runId !== event.runId) {
           return;
         }
 
-        maybeExpireClaim(epoch, leaseMs, activeRunLeaseMs);
-
-        const claim = epoch.claim;
-        if (!claim || claim.agentId !== agentId) {
-          return;
-        }
-
-        if (claim.sessionKey && ctx.sessionKey && claim.sessionKey !== ctx.sessionKey) {
-          return;
-        }
-        if (claim.sessionId && ctx.sessionId && claim.sessionId !== ctx.sessionId) {
-          return;
-        }
-        if (!claim.runId || event.runId !== claim.runId) {
-          return;
-        }
         if (!isOnlyNoReplyOutput(event.assistantTexts)) {
-          const approvedOutputTextNormalized = normalizeComparableText(event.assistantTexts.join("\n\n"));
-          if (approvedOutputTextNormalized) {
-            claim.approvedOutputTextNormalized = approvedOutputTextNormalized;
-            touchClaim(claim);
-            epoch.updatedAt = nowMs();
-            epochsByConversation.set(conversationKey, epoch);
-          }
+          rememberActiveRun({
+            conversationKey,
+            channelId: activeRun.channelId,
+            conversationId: activeRun.conversationId,
+            agentId,
+            sourceMessageId: activeRun.sourceMessageId,
+            sessionKey: activeRun.sessionKey,
+            sessionId: activeRun.sessionId,
+            runId: activeRun.runId,
+          });
           return;
         }
 
-        const latest = getLatestVisible(epoch);
-        if (!latest || latest.messageId !== claim.sourceMessageId) {
-          clearClaim(epoch);
-          epochsByConversation.set(conversationKey, epoch);
-          clearActiveTurn(conversationKey, agentId);
-          void maybeLaunchDeferredBatonsForConversation(conversationKey);
-          return;
-        }
-
-        markDeclined(epoch, agentId, claim.sourceMessageId);
-        clearClaim(epoch);
-        if (haveAllEligibleAgentsDeclined(epoch, claim.sourceMessageId)) {
-          deleteEpoch(conversationKey);
-        } else {
-          epochsByConversation.set(conversationKey, epoch);
-        }
-        clearActiveTurn(conversationKey, agentId);
-        void maybeLaunchDeferredBatonsForConversation(conversationKey);
-        logDebug(
-          api,
-          debug,
-          `agent ${agentId} declined ${claim.sourceMessageId} in epoch ${epoch.epochId}`,
-        );
+        clearBootstrapLockForAgent(conversationKey, agentId);
+        clearSourceLockForAgent(conversationKey, agentId, activeRun.sourceMessageId);
+        clearPostSendGrace(conversationKey, agentId, activeRun.sourceMessageId);
+        clearActiveRun(conversationKey, agentId);
+        clearSendLockForAgent(conversationKey, agentId);
+        await maybeLaunchDeferredWakesForConversation(conversationKey);
       } catch (err) {
-        api.logger.warn?.(
-          `multi-agent-turn-arbiter: llm_output hook failed (${String(err)})`,
-        );
+        api.logger.warn?.(`multi-agent-turn-arbiter: llm_output hook failed (${String(err)})`);
       }
     });
 
     api.on("message_sending", async (event, ctx) => {
       try {
-        if (!isEnabledForChannel(enabledChannels, ctx.channelId)) {
+        if (!isEnabledForChannel(enabledChannels, trimString(ctx.channelId))) {
           return;
         }
-
-        cleanupEpochs(epochIdleMs, leaseMs, activeRunLeaseMs);
 
         const conversationKey = resolveOutboundConversationKey(
           ctx.channelId,
@@ -2204,189 +1808,196 @@ export default {
         if (!conversationKey) {
           return;
         }
+        await cleanupAndMaybeLaunchConversation(conversationKey);
 
         const accountId = trimString(ctx.accountId);
         const agentId = resolveOutboundAgentId(accountId || undefined, event.metadata, agentByAccount);
         if (!agentId) {
           return;
         }
+        rememberManagedSenderFromMetadata(ctx.channelId, event.metadata, agentId);
 
-        let epoch = epochsByConversation.get(conversationKey);
-        const sessionKey = trimString(ctx.sessionKey) || undefined;
-        const sessionId = trimString(ctx.sessionId) || undefined;
-        const pendingAllowance = getActivePendingAllowance(
-          conversationKey,
-          leaseMs,
-          activeRunLeaseMs,
-        );
-        const latestVisibleForConversation = getLatestVisibleForConversation(conversationKey, epochIdleMs);
-        if (!epoch) {
-          if (getActiveBotReopenGuard(conversationKey)) {
-            return { cancel: true };
-          }
-          if (!pendingAllowance || !isSameAllowanceOwner({ allowance: pendingAllowance, agentId, sessionKey, sessionId })) {
+        const activeRun = getActiveRun(conversationKey, agentId, activeRunLeaseMs);
+        if (!activeRun) {
+          logDebug(api, debug, `cancelled outbound from ${agentId}; no active run for ${conversationKey}`);
+          return { cancel: true };
+        }
+
+        const pendingSourceMessageId = buildPendingSourceMessageId(conversationKey);
+        if (trimString(event.content) === "NO_REPLY") {
+          clearBootstrapLockForAgent(conversationKey, agentId);
+          clearSourceLockForAgent(conversationKey, agentId, activeRun.sourceMessageId);
+          clearPostSendGrace(conversationKey, agentId, activeRun.sourceMessageId);
+          clearActiveRun(conversationKey, agentId);
+          clearSendLockForAgent(conversationKey, agentId);
+          await maybeLaunchDeferredWakesForConversation(conversationKey);
+          return { cancel: true };
+        }
+
+        if (activeRun.sourceMessageId === pendingSourceMessageId) {
+          const bootstrapLock = getBootstrapLock(
+            conversationKey,
+            reservationLeaseMs,
+            activeRunLeaseMs,
+          );
+          if (!bootstrapLock || bootstrapLock.agentId !== agentId) {
+            clearBootstrapLockForAgent(conversationKey, agentId);
+            clearSourceLockForAgent(conversationKey, agentId, activeRun.sourceMessageId);
+            clearPostSendGrace(conversationKey, agentId, activeRun.sourceMessageId);
+            clearActiveRun(conversationKey, agentId);
+            clearSendLockForAgent(conversationKey, agentId);
             logDebug(
               api,
               debug,
-              `cancelled outbound from ${agentId}; conversation=${conversationKey} has no epoch and no active pending allowance`,
+              `cancelled outbound from ${agentId}; bootstrap owner is ${bootstrapLock?.agentId ?? "none"} in ${conversationKey}`,
             );
             return { cancel: true };
           }
-          const conversationId =
-            trimString(event.metadata?.["threadId"]) ||
-            trimString(ctx.conversationId) ||
-            trimString(event.to);
-          const targetAgents = getAllChannelAgents(ctx.channelId, agentAccounts);
-          if (!conversationId || targetAgents.length === 0) {
-            return;
-          }
-          epoch = makePendingEpoch({
+        } else {
+          const sourceLock = getSourceLock(
             conversationKey,
-            channelId: ctx.channelId,
-            conversationId,
-            targetAgents,
-          });
-          epoch.claim = makeClaimFromPendingAllowance(pendingAllowance, epoch.rootMessageId);
-          clearPendingAllowance(conversationKey);
-          epochsByConversation.set(conversationKey, epoch);
-          logDebug(api, debug, `created pending epoch ${epoch.epochId} claimed by ${agentId}`);
-        }
-
-        if (!epoch.targetAgents.includes(agentId)) {
-          return { cancel: true };
-        }
-
-        if (trimString(event.content) === "NO_REPLY") {
-          return { cancel: true };
-        }
-
-        maybeExpireClaim(epoch, leaseMs, activeRunLeaseMs);
-
-        let claim = epoch.claim;
-        if (!claim && pendingAllowance && isSameAllowanceOwner({ allowance: pendingAllowance, agentId, sessionKey, sessionId })) {
-          const latestVisible = getLatestVisible(epoch);
-          epoch.claim = makeClaimFromPendingAllowance(
-            pendingAllowance,
-            latestVisible?.messageId ?? epoch.rootMessageId,
+            reservationLeaseMs,
+            activeRunLeaseMs,
           );
-          clearPendingAllowance(conversationKey);
-          epoch.updatedAt = nowMs();
-          epochsByConversation.set(conversationKey, epoch);
-          claim = epoch.claim;
+          if (
+            !sourceLock ||
+            sourceLock.sourceMessageId !== activeRun.sourceMessageId ||
+            sourceLock.agentId !== agentId
+          ) {
+            clearBootstrapLockForAgent(conversationKey, agentId);
+            clearSourceLockForAgent(conversationKey, agentId, activeRun.sourceMessageId);
+            clearPostSendGrace(conversationKey, agentId, activeRun.sourceMessageId);
+            clearActiveRun(conversationKey, agentId);
+            clearSendLockForAgent(conversationKey, agentId);
+            logDebug(
+              api,
+              debug,
+              `cancelled outbound from ${agentId}; source owner is ${sourceLock?.agentId ?? "none"} lockSource=${sourceLock?.sourceMessageId ?? "none"} activeSource=${activeRun.sourceMessageId} in ${conversationKey}`,
+            );
+            return { cancel: true };
+          }
+        }
+
+        const deferredWake = getDeferredWake(conversationKey, agentId, stateIdleMs);
+        if (
+          deferredWake &&
+          deferredWake.sourceMessageId &&
+          deferredWake.sourceMessageId !== activeRun.sourceMessageId
+        ) {
+          clearBootstrapLockForAgent(conversationKey, agentId);
+          clearSourceLockForAgent(conversationKey, agentId, activeRun.sourceMessageId);
+          clearPostSendGrace(conversationKey, agentId, activeRun.sourceMessageId);
+          clearActiveRun(conversationKey, agentId);
+          clearSendLockForAgent(conversationKey, agentId);
+          await maybeLaunchDeferredWakesForConversation(conversationKey);
           logDebug(
             api,
             debug,
-            `adopted pending allowance for ${agentId} into epoch ${epoch.epochId}`,
+            `cancelled outbound from ${agentId}; stale source=${activeRun.sourceMessageId} deferred=${deferredWake.sourceMessageId}`,
           );
+          return { cancel: true };
         }
 
-        if (!claim || claim.agentId !== agentId) {
-          if (latestVisibleForConversation) {
-            rememberDeferredBatonForBusyAgent({
+        const latestVisible = getLatestVisibleForConversation(conversationKey, stateIdleMs);
+        const latestVisibleSupersedesActiveRun =
+          activeRun.sourceMessageId !== pendingSourceMessageId &&
+          !!latestVisible &&
+          latestVisible.messageId !== activeRun.sourceMessageId &&
+          (latestVisible.kind === "external" || latestVisible.senderAgentId !== agentId);
+        if (latestVisibleSupersedesActiveRun && latestVisible) {
+          const latestEligibleAgents = getEligibleAgentsForVisibleMessage(
+            latestVisible,
+            activeRun.channelId,
+            agentAccounts,
+          );
+          reconcileDeferredWakesForSupersededSource({
+            conversationKey,
+            supersededSourceMessageId: activeRun.sourceMessageId,
+            replacementSourceMessageId: latestVisible.messageId,
+            replacementEligibleAgents: latestEligibleAgents,
+          });
+          if (latestEligibleAgents.includes(agentId)) {
+            rememberDeferredWake({
               conversationKey,
-              channelId: ctx.channelId,
-              conversationId: trimString(ctx.conversationId) || trimString(event.to),
+              channelId: activeRun.channelId,
+              conversationId: activeRun.conversationId,
               agentId,
-              sourceMessageId: latestVisibleForConversation.messageId,
-              sessionKey: sessionKey || buildDerivedSessionKey(agentId, conversationKey),
-              sessionId,
+              sourceMessageId: latestVisible.messageId,
+              sessionKey: activeRun.sessionKey,
+              sessionId: activeRun.sessionId,
             });
           }
-          clearActiveTurn(conversationKey, agentId);
-          void maybeLaunchDeferredBatonsForConversation(conversationKey);
+          clearBootstrapLockForAgent(conversationKey, agentId);
+          clearSourceLockForAgent(conversationKey, agentId, activeRun.sourceMessageId);
+          clearPostSendGrace(conversationKey, agentId, activeRun.sourceMessageId);
+          clearActiveRun(conversationKey, agentId);
+          clearSendLockForAgent(conversationKey, agentId);
+          await maybeLaunchDeferredWakesForConversation(conversationKey);
           logDebug(
             api,
             debug,
-            `cancelled outbound from ${agentId}; epoch=${epoch.epochId} claim=${claim?.agentId ?? "none"}`,
+            `cancelled outbound from ${agentId}; stale source=${activeRun.sourceMessageId} latest=${latestVisible.messageId}`,
           );
           return { cancel: true };
         }
 
-        if (claim.sessionKey && ctx.sessionKey && claim.sessionKey !== ctx.sessionKey) {
-          return { cancel: true };
-        }
-
-        if (claim.sessionId && ctx.sessionId && claim.sessionId !== ctx.sessionId) {
-          return { cancel: true };
-        }
-
-        const latest = getLatestVisible(epoch);
-        if (!latest) {
-          epoch.updatedAt = nowMs();
-          epochsByConversation.set(conversationKey, epoch);
-          return;
-        }
-
-        if (latestVisibleForConversation && latestVisibleForConversation.messageId !== claim.sourceMessageId) {
-          rememberDeferredBatonForBusyAgent({
-            conversationKey,
-            channelId: ctx.channelId,
-            conversationId: epoch.conversationId,
-            agentId,
-            sourceMessageId: latestVisibleForConversation.messageId,
-            sessionKey: claim.sessionKey || sessionKey || buildDerivedSessionKey(agentId, conversationKey),
-            sessionId: claim.sessionId || sessionId,
-          });
-          clearClaim(epoch);
-          epochsByConversation.set(conversationKey, epoch);
-          clearActiveTurn(conversationKey, agentId);
-          void maybeLaunchDeferredBatonsForConversation(conversationKey);
+        const sendLock = getSendLock(conversationKey, activeRunLeaseMs);
+        if (
+          sendLock &&
+          sendLock.sourceMessageId === activeRun.sourceMessageId &&
+          sendLock.agentId !== agentId
+        ) {
+          clearBootstrapLockForAgent(conversationKey, agentId);
+          clearSourceLockForAgent(conversationKey, agentId, activeRun.sourceMessageId);
+          clearPostSendGrace(conversationKey, agentId, activeRun.sourceMessageId);
+          clearActiveRun(conversationKey, agentId);
+          clearSendLockForAgent(conversationKey, agentId);
+          await maybeLaunchDeferredWakesForConversation(conversationKey);
           logDebug(
             api,
             debug,
-            `cancelled outbound from ${agentId}; source=${claim.sourceMessageId} stale against latest=${latestVisibleForConversation.messageId}`,
+            `cancelled outbound from ${agentId}; source=${activeRun.sourceMessageId} already won by ${sendLock.agentId}`,
           );
           return { cancel: true };
         }
 
-        const normalizedExpectedText = normalizeComparableText(event.content);
-        const approvedOutputTextNormalized = claim.approvedOutputTextNormalized ?? "";
-        if (normalizedExpectedText) {
-          if (!approvedOutputTextNormalized) {
-            logDebug(
-              api,
-              debug,
-              `cancelled outbound from ${agentId}; epoch=${epoch.epochId} missing approved llm_output`,
-            );
-            return { cancel: true };
-          }
-          if (
-            !approvedOutputTextNormalized.includes(normalizedExpectedText) &&
-            !normalizedExpectedText.includes(approvedOutputTextNormalized)
-          ) {
-            logDebug(
-              api,
-              debug,
-              `cancelled outbound from ${agentId}; epoch=${epoch.epochId} approved output mismatch`,
-            );
-            return { cancel: true };
-          }
-          claim.expectedTextNormalized = normalizeComparableText(
-            `${claim.expectedTextNormalized ?? ""}\n${event.content}`,
-          );
-        }
-
-        if (!claim.accountId && accountId) {
-          claim.accountId = accountId;
-        }
-        touchClaim(claim);
-        epoch.updatedAt = nowMs();
-        epochsByConversation.set(conversationKey, epoch);
-        rememberActiveTurn({
+        setSendLock({
           conversationKey,
           agentId,
-          sourceMessageId: claim.sourceMessageId,
-          claimedAt: claim.claimedAt,
-          sessionKey: claim.sessionKey || sessionKey || buildDerivedSessionKey(agentId, conversationKey),
-          sessionId: claim.sessionId || sessionId,
-          runId: claim.runId,
+          sourceMessageId: activeRun.sourceMessageId,
+          sessionKey: activeRun.sessionKey,
+          sessionId: activeRun.sessionId,
         });
-
-        return;
+        if (activeRun.sourceMessageId === pendingSourceMessageId) {
+          setBootstrapLock({
+            conversationKey,
+            agentId,
+            phase: "active",
+            sessionKey: activeRun.sessionKey,
+            sessionId: activeRun.sessionId,
+          });
+        } else {
+          setSourceLock({
+            conversationKey,
+            agentId,
+            sourceMessageId: activeRun.sourceMessageId,
+            phase: "active",
+            sessionKey: activeRun.sessionKey,
+            sessionId: activeRun.sessionId,
+          });
+        }
+        rememberActiveRun({
+          conversationKey,
+          channelId: activeRun.channelId,
+          conversationId: activeRun.conversationId,
+          agentId,
+          sourceMessageId: activeRun.sourceMessageId,
+          sessionKey: activeRun.sessionKey,
+          sessionId: activeRun.sessionId,
+          runId: activeRun.runId,
+        });
       } catch (err) {
-        api.logger.warn?.(
-          `multi-agent-turn-arbiter: message_sending hook failed (${String(err)})`,
-        );
+        api.logger.warn?.(`multi-agent-turn-arbiter: message_sending hook failed (${String(err)})`);
         if (failOpen) {
           return;
         }
@@ -2396,11 +2007,9 @@ export default {
 
     api.on("message_sent", async (event, ctx) => {
       try {
-        if (!isEnabledForChannel(enabledChannels, ctx.channelId)) {
+        if (!isEnabledForChannel(enabledChannels, trimString(ctx.channelId))) {
           return;
         }
-
-        cleanupEpochs(epochIdleMs, leaseMs, activeRunLeaseMs);
 
         const conversationKey = resolveOutboundConversationKey(
           ctx.channelId,
@@ -2411,104 +2020,105 @@ export default {
         if (!conversationKey) {
           return;
         }
-
-        const epoch = epochsByConversation.get(conversationKey);
-        if (!epoch) {
-          return;
-        }
+        await cleanupAndMaybeLaunchConversation(conversationKey);
 
         const accountId = trimString(ctx.accountId);
         const agentId = resolveOutboundAgentId(accountId || undefined, event.metadata, agentByAccount);
-        if (!agentId || !epoch.targetAgents.includes(agentId)) {
+        if (!agentId) {
           return;
         }
+        rememberManagedSenderFromMetadata(ctx.channelId, event.metadata, agentId);
 
-        if (!event.success) {
-          if (epoch.claim?.agentId === agentId) {
-            clearClaim(epoch);
-            epochsByConversation.set(conversationKey, epoch);
-            clearActiveTurn(conversationKey, agentId);
-            void maybeLaunchDeferredBatonsForConversation(conversationKey);
+        if (event.success) {
+          const pendingSourceMessageId = buildPendingSourceMessageId(conversationKey);
+          const activeRun = getActiveRun(conversationKey, agentId, activeRunLeaseMs);
+          if (activeRun) {
+            rememberActiveRun({
+              conversationKey,
+              channelId: activeRun.channelId,
+              conversationId: activeRun.conversationId,
+              agentId,
+              sourceMessageId: activeRun.sourceMessageId,
+              sessionKey: activeRun.sessionKey,
+              sessionId: activeRun.sessionId,
+              runId: activeRun.runId,
+            });
+            if (activeRun.sourceMessageId === pendingSourceMessageId) {
+              setBootstrapLock({
+                conversationKey,
+                agentId,
+                phase: "active",
+                sessionKey: activeRun.sessionKey,
+                sessionId: activeRun.sessionId,
+              });
+            } else {
+              setSourceLock({
+                conversationKey,
+                agentId,
+                sourceMessageId: activeRun.sourceMessageId,
+                phase: "active",
+                sessionKey: activeRun.sessionKey,
+                sessionId: activeRun.sessionId,
+              });
+            }
+            rememberPostSendGrace({
+              conversationKey,
+              agentId,
+              sourceMessageId: activeRun.sourceMessageId,
+              sessionKey: activeRun.sessionKey,
+              sessionId: activeRun.sessionId,
+            });
+          }
+          const sendLock = getSendLock(conversationKey, activeRunLeaseMs);
+          if (sendLock?.agentId === agentId) {
+            setSendLock({
+              conversationKey,
+              agentId,
+              sourceMessageId: sendLock.sourceMessageId,
+              sessionKey: sendLock.sessionKey,
+              sessionId: sendLock.sessionId,
+            });
           }
           return;
         }
 
-        const claim = epoch.claim;
-        if (!claim || claim.agentId !== agentId) {
-          return;
-        }
-
-        if (claim.sessionKey && ctx.sessionKey && claim.sessionKey !== ctx.sessionKey) {
-          return;
-        }
-
-        if (claim.sessionId && ctx.sessionId && claim.sessionId !== ctx.sessionId) {
-          return;
-        }
-
-        claim.sendCompletedAt = nowMs();
-        touchClaim(claim);
-        epoch.updatedAt = claim.sendCompletedAt;
-        epochsByConversation.set(conversationKey, epoch);
-        rememberActiveTurn({
-          conversationKey,
-          agentId,
-          sourceMessageId: claim.sourceMessageId,
-          claimedAt: claim.claimedAt,
-          sessionKey: claim.sessionKey || trimString(ctx.sessionKey) || buildDerivedSessionKey(agentId, conversationKey),
-          sessionId: claim.sessionId || trimString(ctx.sessionId) || undefined,
-          runId: claim.runId,
-        });
-        scheduleClaimFinalize(conversationKey, epoch.epochId, claim.claimedAt);
-        logDebug(
-          api,
-          debug,
-          `observed successful outbound from ${agentId} for epoch ${epoch.epochId}; waiting ${settleMs}ms to settle visible messages`,
-        );
+        const activeRun = getActiveRun(conversationKey, agentId, activeRunLeaseMs);
+        clearBootstrapLockForAgent(conversationKey, agentId);
+        clearSourceLockForAgent(conversationKey, agentId, activeRun?.sourceMessageId);
+        clearPostSendGrace(conversationKey, agentId, activeRun?.sourceMessageId);
+        clearActiveRun(conversationKey, agentId);
+        clearSendLockForAgent(conversationKey, agentId);
+        await maybeLaunchDeferredWakesForConversation(conversationKey);
       } catch (err) {
-        api.logger.warn?.(
-          `multi-agent-turn-arbiter: message_sent hook failed (${String(err)})`,
-        );
+        api.logger.warn?.(`multi-agent-turn-arbiter: message_sent hook failed (${String(err)})`);
       }
     });
 
-    api.on("agent_end", async (event, ctx) => {
+    api.on("agent_end", async (_event, ctx) => {
       try {
         if (!isEnabledForChannel(enabledChannels, trimString(ctx.channelId))) {
           return;
         }
-
-        if (event.success) {
-          return;
-        }
-
-        cleanupEpochs(epochIdleMs, leaseMs, activeRunLeaseMs);
 
         const conversationKey = resolveConversationKeyFromSessionKey(ctx.sessionKey, ctx.channelId);
         const agentId = trimString(ctx.agentId);
         if (!conversationKey || !agentId) {
           return;
         }
+        await cleanupAndMaybeLaunchConversation(conversationKey);
 
-        const epoch = epochsByConversation.get(conversationKey);
-        if (!epoch) {
-          return;
+        const activeRun = getActiveRun(conversationKey, agentId, activeRunLeaseMs);
+        const sendLock = getSendLock(conversationKey, activeRunLeaseMs);
+        clearBootstrapLockForAgent(conversationKey, agentId);
+        clearSourceLockForAgent(conversationKey, agentId, activeRun?.sourceMessageId);
+        clearPostSendGrace(conversationKey, agentId, activeRun?.sourceMessageId);
+        clearActiveRun(conversationKey, agentId);
+        if (sendLock?.agentId === agentId) {
+          clearSendLockForAgent(conversationKey, agentId);
         }
-
-        const claim = epoch.claim;
-        if (!claim || claim.agentId !== agentId) {
-          return;
-        }
-
-        clearClaim(epoch);
-        epochsByConversation.set(conversationKey, epoch);
-        clearActiveTurn(conversationKey, agentId);
-        void maybeLaunchDeferredBatonsForConversation(conversationKey);
-        logDebug(api, debug, `cleared failed claim for ${agentId} in epoch ${epoch.epochId}`);
+        await maybeLaunchDeferredWakesForConversation(conversationKey);
       } catch (err) {
-        api.logger.warn?.(
-          `multi-agent-turn-arbiter: agent_end hook failed (${String(err)})`,
-        );
+        api.logger.warn?.(`multi-agent-turn-arbiter: agent_end hook failed (${String(err)})`);
       }
     });
   },

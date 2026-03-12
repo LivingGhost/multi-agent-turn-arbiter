@@ -10,35 +10,25 @@
         "items": { "type": "string" },
         "default": []
       },
-      "leaseMs": {
-        "type": "number",
-        "default": 30000,
-        "minimum": 1000
-      },
       "activeRunLeaseMs": {
         "type": "number",
-        "default": 300000,
+        "default": 180000,
         "minimum": 1000
       },
-      "settleMs": {
+      "reservationLeaseMs": {
         "type": "number",
         "default": 10000,
-        "minimum": 250
+        "minimum": 1000
       },
-      "botReopenCooldownMs": {
+      "postSendGraceMs": {
         "type": "number",
-        "default": 30000,
-        "minimum": 0
+        "default": 15000,
+        "minimum": 1000
       },
-      "epochIdleMs": {
+      "stateIdleMs": {
         "type": "number",
         "default": 300000,
-        "minimum": 60000
-      },
-      "maxBotHops": {
-        "type": "number",
-        "default": 16,
-        "minimum": -1
+        "minimum": 1000
       },
       "maxBacklogTurns": {
         "type": "number",
