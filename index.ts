@@ -851,6 +851,27 @@ function clearPostSendGrace(
   postSendGracesByConversationAgent.delete(key);
 }
 
+function getPostSendGrace(
+  conversationKey: string,
+  agentId: string,
+  postSendGraceMs: number,
+  sourceMessageId?: string,
+): PostSendGraceRecord | undefined {
+  const key = makeConversationAgentKey(conversationKey, agentId);
+  const existing = postSendGracesByConversationAgent.get(key);
+  if (!existing) {
+    return undefined;
+  }
+  if (sourceMessageId && existing.sourceMessageId !== sourceMessageId) {
+    return undefined;
+  }
+  if (nowMs() - existing.updatedAt <= postSendGraceMs) {
+    return existing;
+  }
+  postSendGracesByConversationAgent.delete(key);
+  return undefined;
+}
+
 function formatSpeakerLabel(message: VisibleMessage, agentLabelById: Map<string, string>): string {
   if (message.kind === "external") {
     return message.senderName || message.senderKey || "External";
@@ -1447,11 +1468,13 @@ export default {
         }
 
         if (senderActiveRun) {
-          clearPostSendGrace(
+          rememberPostSendGrace({
             conversationKey,
-            senderAgentId,
-            senderActiveRun.sourceMessageId,
-          );
+            agentId: senderAgentId,
+            sourceMessageId: senderActiveRun.sourceMessageId,
+            sessionKey: senderActiveRun.sessionKey,
+            sessionId: senderActiveRun.sessionId,
+          });
           rememberActiveRun({
             conversationKey,
             channelId: senderActiveRun.channelId,
@@ -1973,11 +1996,25 @@ export default {
         }
 
         const latestVisible = getLatestVisibleForConversation(conversationKey, stateIdleMs);
+        const activePostSendGrace = getPostSendGrace(
+          conversationKey,
+          agentId,
+          postSendGraceMs,
+          activeRun.sourceMessageId,
+        );
+        const sameAgentFollowUpChunkAllowed =
+          !!latestVisible &&
+          latestVisible.kind === "agent" &&
+          latestVisible.senderAgentId === agentId &&
+          latestVisible.messageId !== activeRun.sourceMessageId &&
+          !!activePostSendGrace;
         const latestVisibleSupersedesActiveRun =
           activeRun.sourceMessageId !== pendingSourceMessageId &&
           !!latestVisible &&
           latestVisible.messageId !== activeRun.sourceMessageId &&
-          (latestVisible.kind === "external" || latestVisible.senderAgentId !== agentId);
+          (latestVisible.kind === "external" ||
+            latestVisible.senderAgentId !== agentId ||
+            !sameAgentFollowUpChunkAllowed);
         if (latestVisibleSupersedesActiveRun && latestVisible) {
           const latestEligibleAgents = getEligibleAgentsForVisibleMessage(
             latestVisible,

@@ -115,7 +115,7 @@ Then allow and enable it in `openclaw.json`:
 - If a conversation was already marked pending when a newer inbound visible message arrives, deferred waiters are rebound to that newer visible source before launch.
 - Initial empty-state serialization uses a short bootstrap lock. If the plugin was restarted and still has no fresh visible backlog, the winner must rely on normal session history for that first reply.
 - Cleanup only marks conversations as needing a deferred wake. Actual wake launches are limited to safe current-conversation request paths, after backlog state is already current, including run-end handoff on `agent_end`.
-- If one visible turn is split across multiple managed-agent messages, the plugin holds handoff until that sender run ends.
+- If one visible turn is split across multiple managed-agent messages, follow-up chunks are allowed only while a short post-send grace window for that same source is still active.
 - The plugin keeps only short-lived in-memory state. Older context is expected to come from normal OpenClaw session history, not from this plugin.
 
 ## Repo Layout
