@@ -4,21 +4,22 @@ OpenClaw plugin for keeping visible multi-agent replies orderly in one shared co
 
 ## What It Does
 
-When multiple managed agents are present in the same chat, this plugin keeps a short in-memory visible backlog per conversation and uses that backlog to coordinate replies.
+When multiple managed agents are present in the same chat, this plugin keeps a short in-memory visible backlog per conversation and schedules a single current owner for each visible source.
 
 The model is intentionally simple:
 
-- new runs look at the latest retained visible backlog
-- if the plugin has no fresh visible backlog yet, only one managed agent may own the initial conversation start at a time
-- only one managed agent may own a given visible source message at a time
-- non-owners may still run internally, but they are ignored at `llm_input` and hard-cancelled at `message_sending`
-- if an agent is already busy, newer visible messages are deferred for that same agent
-- a busy run may continue in the background, but stale visible output is dropped before send
-- if a managed agent is still visibly in the middle of its turn, other agents wait until that run ends
-- once it finishes, that agent can be woken once to catch up from the latest deferred visible message
-- if two agents try to send against the same visible source, only the first send is allowed through
+- a conversation keeps only four pieces of live state:
+  - `latestVisible`
+  - retained visible `history`
+  - one `current` owner turn
+  - one `pending` latest source to catch up to
+- only the current owner may progress past `llm_input` and send visible output
+- if a newer visible message arrives while an owner is still running, that run is best-effort aborted and the newer source becomes pending
+- when the current owner ends, the pending latest source is enqueued once through core `subagent.enqueue(...)`
+- stale visible sends are canceled before delivery
+- same-agent follow-up chunks are allowed only during a short fixed post-send grace window
 
-The goal is practical visible-turn coordination. It does not hard-cancel model generations that already started.
+The goal is practical visible-turn coordination. It does not rely on request-scoped plugin wake launches and it does not promise hard cancellation unless the core `abort` primitive succeeds.
 
 ## How It Works
 
@@ -26,12 +27,9 @@ The plugin keeps short-lived in-memory state per conversation:
 
 - the latest visible message seen in the room
 - a short retained visible backlog for prompt reconstruction
-- a short bootstrap lock for the very first reply when no fresh visible backlog is cached yet
-- a short reserved/active source lock so only one managed agent may answer a given visible source at a time
-- active in-flight runs per agent
-- one deferred wake source per conversation+agent
-- a short send lock so only one visible send wins for the same source message
-- a short post-send grace window so success without visible echo does not leak locks until the full active-run lease
+- a single current owner turn
+- a single pending latest source to hand off after the current owner ends
+- a short post-send grace window for valid same-run chunking
 
 It uses these OpenClaw hooks:
 
@@ -55,6 +53,9 @@ In practice, it works best with an OpenClaw build that exposes:
   - `threadId`
   - `sessionKey`
   - `agentId`
+- plugin runtime primitives:
+  - `subagent.enqueue(...)`
+  - `subagent.abort(...)`
 
 Without that metadata, visible sender attribution and stale-send suppression are less reliable.
 
@@ -78,7 +79,6 @@ Then allow and enable it in `openclaw.json`:
         "config": {
           "enabledChannels": [],
           "activeRunLeaseMs": 180000,
-          "reservationLeaseMs": 10000,
           "postSendGraceMs": 15000,
           "stateIdleMs": 300000,
           "maxBacklogTurns": 6,
@@ -99,9 +99,8 @@ Then allow and enable it in `openclaw.json`:
 | `enabled` | Turns the plugin on or off. |
 | `enabledChannels` | Optional allowlist of channel IDs. Empty means all channels. |
 | `activeRunLeaseMs` | Maximum age for an in-flight run before the plugin treats it as stale and releases it. Default: `180000`. |
-| `reservationLeaseMs` | Maximum age for a reserved initial/source lock before it is discarded if no real run starts. Expired reservations immediately re-open deferred waiters. Default: `10000`. |
-| `postSendGraceMs` | How long to keep a successful send alive while waiting for visible echo or `agent_end` before forcing release. Default: `15000`. |
-| `stateIdleMs` | Idle timeout for clearing retained in-memory conversation state such as latest visible messages, visible backlog, deferred wakes, and send locks. Default: `300000`. |
+| `postSendGraceMs` | Fixed grace window after the current owner’s first visible output during which same-run follow-up chunks are still allowed. Default: `15000`. |
+| `stateIdleMs` | Idle timeout for clearing retained in-memory conversation state such as latest visible messages, visible backlog, pending catch-up sources, and current owner state. Default: `300000`. |
 | `maxBacklogTurns` | Maximum number of newest visible conversation turns to retain in plugin memory. Consecutive visible messages from the same speaker count as one turn. Set `-1` for unlimited. Default: `6`. |
 | `maxPromptChars` | Character budget for plugin-added visible backlog context. Set `-1` for unlimited. Older retained backlog is dropped from the start if needed. Default: `30000`. |
 | `failOpen` | If true, prefer letting delivery continue on plugin errors instead of blocking output. Default: `true`. |
@@ -110,12 +109,11 @@ Then allow and enable it in `openclaw.json`:
 ## Limits
 
 - It serializes visible output, not hidden generation.
-- If a model run has already started, the plugin cannot hard-cancel it.
+- If a model run has already started, the plugin can only best-effort abort it through core `subagent.abort(...)`.
 - A slow agent may keep running in the background, but if newer visible room state supersedes it, its stale visible send is cancelled before delivery.
-- If a conversation was already marked pending when a newer inbound visible message arrives, deferred waiters are rebound to that newer visible source before launch.
-- Initial empty-state serialization uses a short bootstrap lock. If the plugin was restarted and still has no fresh visible backlog, the winner must rely on normal session history for that first reply.
-- Cleanup only marks conversations as needing a deferred wake. Actual wake launches are limited to safe current-conversation request paths, after backlog state is already current, including run-end handoff on `agent_end`.
-- If one visible turn is split across multiple managed-agent messages, follow-up chunks are allowed only while a short post-send grace window for that same source is still active.
+- If a newer visible message arrives while an owner is still active, the conversation keeps only the latest pending source. Older pending sources are dropped.
+- Initial empty-state serialization still uses a bootstrap owner. If the plugin was restarted and has no fresh visible backlog yet, the winner must rely on normal session history for that first reply.
+- If one visible turn is split across multiple managed-agent messages, follow-up chunks are allowed only while the fixed post-send grace window for that same owner turn is still active.
 - The plugin keeps only short-lived in-memory state. Older context is expected to come from normal OpenClaw session history, not from this plugin.
 
 ## Repo Layout

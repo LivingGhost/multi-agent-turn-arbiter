@@ -15,11 +15,6 @@
         "default": 180000,
         "minimum": 1000
       },
-      "reservationLeaseMs": {
-        "type": "number",
-        "default": 10000,
-        "minimum": 1000
-      },
       "postSendGraceMs": {
         "type": "number",
         "default": 15000,
