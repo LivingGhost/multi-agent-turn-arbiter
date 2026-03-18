@@ -10,25 +10,15 @@
         "items": { "type": "string" },
         "default": []
       },
-      "activeRunLeaseMs": {
+      "maxBufferMessages": {
         "type": "number",
-        "default": 180000,
-        "minimum": 1000
-      },
-      "postSendGraceMs": {
-        "type": "number",
-        "default": 15000,
-        "minimum": 1000
+        "default": 50,
+        "minimum": 10
       },
       "stateIdleMs": {
         "type": "number",
         "default": 300000,
-        "minimum": 1000
-      },
-      "maxBacklogTurns": {
-        "type": "number",
-        "default": 6,
-        "minimum": -1
+        "minimum": 60000
       },
       "maxPromptChars": {
         "type": "number",
