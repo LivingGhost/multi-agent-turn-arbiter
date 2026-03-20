@@ -35,6 +35,7 @@ type BufferedMessage = {
 type AgentRunState = {
   runId?: string;
   thinking: boolean;
+  dirty: boolean;
 };
 
 type ConversationState = {
@@ -374,6 +375,7 @@ export default {
         }
         run.runId = undefined;
         run.thinking = false;
+        run.dirty = false;
       }
     }
 
@@ -383,45 +385,66 @@ export default {
       }
     }
 
-    async function triggerAgents(
-      conv: ConversationState,
-      excludeAgentId?: string,
-    ): Promise<void> {
-      if (quietMode) return;
-
+    function queueTriggerAgents(conv: ConversationState, excludeAgentId?: string): void {
       for (const agentId of managedAgentIds) {
         if (agentId === excludeAgentId) continue;
 
         let run = conv.agentRuns.get(agentId);
         if (!run) {
-          run = { thinking: false };
+          run = { thinking: false, dirty: false };
           conv.agentRuns.set(agentId, run);
         }
 
-        // Cancel previous thinking
-        if (run.runId) {
-          try {
-            await api.runtime.subagent.abort({ runId: run.runId });
-          } catch {}
+        if (run.thinking) {
+          // Already running — mark dirty so it re-triggers after completion
+          run.dirty = true;
+          // Abort the in-flight run so it finishes sooner
+          if (run.runId) {
+            void api.runtime.subagent.abort({ runId: run.runId }).catch(() => {});
+          }
+          log(`marked ${agentId} dirty for ${conv.conversationKey}`);
+        } else {
+          // Idle — trigger immediately
+          run.dirty = false;
+          void executeAgentTrigger(conv, agentId, run).catch(() => {});
         }
+      }
+    }
 
-        // Start new thinking
-        const sessionKey = buildDerivedSessionKey(agentId, conv.conversationKey);
-        try {
-          const result = await api.runtime.subagent.enqueue({
-            sessionKey,
-            message: "Participate in the conversation naturally, or output NO_REPLY if you have nothing to add.",
-            deliver: true,
-            idempotencyKey: `arbiter:${conv.conversationKey}:${agentId}:${Date.now()}`,
-          });
-          run.runId = result.runId;
-          run.thinking = true;
-          log(`triggered ${agentId} for ${conv.conversationKey}`);
-        } catch (err) {
-          api.logger.warn?.(`arbiter: failed to trigger ${agentId}: ${err}`);
-          run.runId = undefined;
-          run.thinking = false;
-        }
+    async function executeAgentTrigger(
+      conv: ConversationState,
+      agentId: string,
+      run: AgentRunState,
+    ): Promise<void> {
+      const sessionKey = buildDerivedSessionKey(agentId, conv.conversationKey);
+      run.thinking = true;
+      try {
+        log(`enqueuing ${agentId} for ${conv.conversationKey}`);
+        const result = await api.runtime.subagent.enqueue({
+          sessionKey,
+          message: "Participate in the conversation naturally, or output NO_REPLY if you have nothing to add.",
+          deliver: true,
+          lane: `subagent:arbiter:${agentId}`,
+          idempotencyKey: `arbiter:${conv.conversationKey}:${agentId}:${Date.now()}`,
+        });
+        run.runId = result.runId;
+        log(`enqueued ${agentId} runId=${result.runId}`);
+      } catch (err) {
+        api.logger.warn?.(`arbiter: failed to trigger ${agentId}: ${err}`);
+        run.runId = undefined;
+        run.thinking = false;
+        run.dirty = false;
+      }
+    }
+
+    function handleAgentRunCompleted(conv: ConversationState, agentId: string): void {
+      const run = conv.agentRuns.get(agentId);
+      if (!run) return;
+      run.runId = undefined;
+      run.thinking = false;
+      if (run.dirty) {
+        run.dirty = false;
+        void executeAgentTrigger(conv, agentId, run).catch(() => {});
       }
     }
 
@@ -482,8 +505,9 @@ export default {
           quietMode = false;
         }
 
-        // Cancel stale thinking and trigger rethink with latest context
-        await triggerAgents(conv, senderAgentId);
+        // Cancel stale thinking and trigger rethink with latest context (fire-and-forget)
+        api.logger.warn?.(`arbiter: message_received channelId=${channelId} senderAgentId=${senderAgentId} managedAgents=[${[...managedAgentIds].join(",")}] convKey=${conv.conversationKey}`);
+        queueTriggerAgents(conv, senderAgentId);
       } catch (err) {
         api.logger.warn?.(`arbiter: message_received failed: ${err}`);
       }
@@ -605,8 +629,8 @@ export default {
         const conv = conversations.get(conversationKey);
         if (!conv) return;
 
-        // Trigger other agents to consider responding
-        await triggerAgents(conv, agentId);
+        // Trigger other agents to consider responding (fire-and-forget to avoid blocking the hook)
+        queueTriggerAgents(conv, agentId);
       } catch (err) {
         api.logger.warn?.(`arbiter: message_sent failed: ${err}`);
       }
@@ -626,9 +650,8 @@ export default {
         if (!conversationKey) return;
 
         const conv = conversations.get(conversationKey);
-        const run = conv?.agentRuns.get(agentId);
-        if (run) {
-          run.thinking = false;
+        if (conv) {
+          handleAgentRunCompleted(conv, agentId);
         }
       } catch (err) {
         api.logger.warn?.(`arbiter: agent_end failed: ${err}`);
