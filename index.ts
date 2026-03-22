@@ -35,7 +35,7 @@ type BufferedMessage = {
 type AgentRunState = {
   runId?: string;
   thinking: boolean;
-  dirty: boolean;
+  cancelled?: boolean;
 };
 
 type ConversationState = {
@@ -44,6 +44,7 @@ type ConversationState = {
   conversationId: string;
   buffer: BufferedMessage[];
   agentRuns: Map<string, AgentRunState>;
+  pendingResponse: boolean;
   updatedAt: number;
 };
 
@@ -133,10 +134,6 @@ function resolveConversationKeyFromSessionKey(
   const stripped = normalizedSessionKey.replace(/^agent:[^:]+:/, "");
   if (!stripped.startsWith(`${normalizedChannelId}:`)) return null;
   return stripped;
-}
-
-function buildDerivedSessionKey(agentId: string, conversationKey: string): string {
-  return `agent:${trimString(agentId)}:${conversationKey}`;
 }
 
 function makeConversationSenderKey(channelId: string, senderKey: string): string {
@@ -281,7 +278,14 @@ function formatBufferTranscript(
 
 const conversations = new Map<string, ConversationState>();
 const seenMessageIds = new Set<string>();
-let quietMode = false;
+const quietAgents = new Set<string>();
+
+// Agent resolution state — module-level so it survives re-registration.
+// Only updated when register receives a config with valid bindings.
+let currentAgentByAccount = new Map<string, string>();
+let currentAgentLabelById = new Map<string, string>();
+let currentManagedAgentIds = new Set<string>();
+let agentStateInitialized = false;
 
 function getConversation(
   conversationKey: string,
@@ -296,6 +300,7 @@ function getConversation(
       conversationId,
       buffer: [],
       agentRuns: new Map(),
+      pendingResponse: false,
       updatedAt: Date.now(),
     };
     conversations.set(conversationKey, state);
@@ -351,9 +356,24 @@ export default {
     const debug = cfg.debug === true;
 
     const agentAccounts = buildAgentAccounts(api.config as OpenClawConfig);
-    const agentByAccount = new Map(agentAccounts.map((e) => [e.accountId, e.agentId]));
-    const agentLabelById = buildAgentLabelById(agentAccounts);
-    const managedAgentIds = new Set(agentAccounts.map((e) => e.agentId));
+    // Update agent state only when config has valid bindings.
+    // Partial configs (e.g. from buildMediaUnderstandingRegistry) lack bindings —
+    // in that case, keep the previously initialized state.
+    if (agentAccounts.length > 0) {
+      currentAgentByAccount = new Map(agentAccounts.map((e) => [e.accountId, e.agentId]));
+      currentAgentLabelById = buildAgentLabelById(agentAccounts);
+      currentManagedAgentIds = new Set(agentAccounts.map((e) => e.agentId));
+      if (!agentStateInitialized) {
+        api.logger.info?.(`arbiter: initialized with ${agentAccounts.length} agent(s): [${[...currentManagedAgentIds].join(",")}]`);
+      }
+      agentStateInitialized = true;
+    } else if (!agentStateInitialized) {
+      return;
+    }
+    // Use module-level state for all closures below.
+    const agentByAccount = currentAgentByAccount;
+    const agentLabelById = currentAgentLabelById;
+    const managedAgentIds = currentManagedAgentIds;
 
     function isEnabled(channelId: string): boolean {
       return enabledChannels.size === 0 || enabledChannels.has(channelId);
@@ -363,88 +383,22 @@ export default {
       if (debug) api.logger.debug?.(`arbiter: ${message}`);
     }
 
-    // --- Cancel & trigger ---
+    // --- Cancel thinking ---
 
-    async function cancelThinkingForConversation(conv: ConversationState): Promise<void> {
-      for (const [agentId, run] of conv.agentRuns) {
-        if (run.runId) {
-          try {
-            await api.runtime.subagent.abort({ runId: run.runId });
-          } catch {}
-          log(`cancelled thinking for ${agentId}`);
-        }
-        run.runId = undefined;
-        run.thinking = false;
-        run.dirty = false;
-      }
-    }
-
-    async function cancelAllThinking(): Promise<void> {
-      for (const conv of conversations.values()) {
-        await cancelThinkingForConversation(conv);
-      }
-    }
-
-    function queueTriggerAgents(conv: ConversationState, excludeAgentId?: string): void {
-      for (const agentId of managedAgentIds) {
-        if (agentId === excludeAgentId) continue;
-
-        let run = conv.agentRuns.get(agentId);
-        if (!run) {
-          run = { thinking: false, dirty: false };
-          conv.agentRuns.set(agentId, run);
-        }
-
-        if (run.thinking) {
-          // Already running — mark dirty so it re-triggers after completion
-          run.dirty = true;
-          // Abort the in-flight run so it finishes sooner
-          if (run.runId) {
-            void api.runtime.subagent.abort({ runId: run.runId }).catch(() => {});
-          }
-          log(`marked ${agentId} dirty for ${conv.conversationKey}`);
-        } else {
-          // Idle — trigger immediately
-          run.dirty = false;
-          void executeAgentTrigger(conv, agentId, run).catch(() => {});
-        }
-      }
-    }
-
-    async function executeAgentTrigger(
-      conv: ConversationState,
-      agentId: string,
-      run: AgentRunState,
-    ): Promise<void> {
-      const sessionKey = buildDerivedSessionKey(agentId, conv.conversationKey);
-      run.thinking = true;
-      try {
-        log(`enqueuing ${agentId} for ${conv.conversationKey}`);
-        const result = await api.runtime.subagent.enqueue({
-          sessionKey,
-          message: "Participate in the conversation naturally, or output NO_REPLY if you have nothing to add.",
-          deliver: true,
-          lane: `subagent:arbiter:${agentId}`,
-          idempotencyKey: `arbiter:${conv.conversationKey}:${agentId}:${Date.now()}`,
-        });
-        run.runId = result.runId;
-        log(`enqueued ${agentId} runId=${result.runId}`);
-      } catch (err) {
-        api.logger.warn?.(`arbiter: failed to trigger ${agentId}: ${err}`);
-        run.runId = undefined;
-        run.thinking = false;
-        run.dirty = false;
-      }
-    }
-
-    function handleAgentRunCompleted(conv: ConversationState, agentId: string): void {
+    function cancelThinkingForAgent(conv: ConversationState, agentId: string): void {
       const run = conv.agentRuns.get(agentId);
-      if (!run) return;
+      if (!run?.runId) return;
+      void api.runtime.agent.abort({ runId: run.runId }).catch(() => {});
+      log(`cancelled ${agentId} runId=${run.runId}`);
       run.runId = undefined;
       run.thinking = false;
-      if (run.dirty) {
-        run.dirty = false;
-        void executeAgentTrigger(conv, agentId, run).catch(() => {});
+      run.cancelled = true;
+    }
+
+    function cancelOtherAgents(conv: ConversationState, excludeAgentId?: string): void {
+      for (const agentId of managedAgentIds) {
+        if (agentId === excludeAgentId) continue;
+        cancelThinkingForAgent(conv, agentId);
       }
     }
 
@@ -452,13 +406,19 @@ export default {
 
     api.registerCommand({
       name: "quiet",
-      description: "Stop all agent responses. Agents resume when you send a new message.",
+      description: "Silence this agent. It resumes when you send a new message.",
       requireAuth: true,
-      handler: async () => {
-        quietMode = true;
-        await cancelAllThinking();
-        log("quiet mode activated");
-        return { text: "All agents silenced. Send a message to resume." };
+      handler: async (ctx) => {
+        const agentId = agentByAccount.get(trimString(ctx.accountId));
+        if (agentId) {
+          quietAgents.add(agentId);
+          for (const conv of conversations.values()) {
+            cancelThinkingForAgent(conv, agentId);
+          }
+          log(`quiet: ${agentId}`);
+          return { text: `${agentId} silenced. Send a new message to resume.` };
+        }
+        return { text: "Could not identify agent." };
       },
     });
 
@@ -500,16 +460,67 @@ export default {
           timestamp: event.timestamp ?? Date.now(),
         }, maxBuffer);
 
+        // New message received — clear pending response flag so fresh
+        // dispatches triggered by this message can proceed.
+        conv.pendingResponse = false;
+
         // Reset quiet mode on external (user) message
         if (!senderAgentId) {
-          quietMode = false;
+          quietAgents.clear();
         }
 
-        // Cancel stale thinking and trigger rethink with latest context (fire-and-forget)
-        api.logger.warn?.(`arbiter: message_received channelId=${channelId} senderAgentId=${senderAgentId} managedAgents=[${[...managedAgentIds].join(",")}] convKey=${conv.conversationKey}`);
-        queueTriggerAgents(conv, senderAgentId);
+        // Cancel stale thinking for other agents — they'll re-run via
+        // normal Discord dispatch when the new message reaches them.
+        log(`message_received channelId=${channelId} senderAgentId=${senderAgentId} convKey=${conv.conversationKey}`);
+        cancelOtherAgents(conv, senderAgentId);
       } catch (err) {
         api.logger.warn?.(`arbiter: message_received failed: ${err}`);
+      }
+    });
+
+    // --- before_agent_start: record runId for abort tracking ---
+
+    api.on("before_agent_start", async (_event, ctx) => {
+      try {
+        const channelId = trimString(ctx.channelId);
+        if (!isEnabled(channelId)) return;
+
+        const agentId = trimString(ctx.agentId);
+        if (!agentId || !managedAgentIds.has(agentId)) return;
+
+        // If this agent is quieted, abort immediately regardless of conversation state.
+        if (quietAgents.has(agentId) && ctx.runId) {
+          void api.runtime.agent.abort({ runId: ctx.runId }).catch(() => {});
+          log(`quiet abort ${agentId} runId=${ctx.runId}`);
+          return;
+        }
+
+        const conversationKey = resolveConversationKeyFromSessionKey(ctx.sessionKey, channelId);
+        if (!conversationKey) return;
+
+        const conv = conversations.get(conversationKey);
+        if (!conv) return;
+
+        // If another agent has already responded but the echo hasn't arrived
+        // yet, this dispatch is stale. Abort — it will be re-triggered when
+        // the responding agent's echo arrives via message_received.
+        if (conv.pendingResponse && ctx.runId) {
+          void api.runtime.agent.abort({ runId: ctx.runId }).catch(() => {});
+          log(`aborted stale dispatch ${agentId}: another agent already responded`);
+          return;
+        }
+
+        let run = conv.agentRuns.get(agentId);
+        if (!run) {
+          run = { thinking: false };
+          conv.agentRuns.set(agentId, run);
+        }
+        run.runId = ctx.runId;
+        run.thinking = true;
+        run.cancelled = false;
+        log(`agent_start ${agentId} runId=${ctx.runId} convKey=${conversationKey}`);
+      } catch (err) {
+        api.logger.warn?.(`arbiter: before_agent_start failed: ${err}`);
       }
     });
 
@@ -519,10 +530,6 @@ export default {
       try {
         const channelId = trimString(ctx.channelId);
         if (!isEnabled(channelId)) return;
-
-        if (quietMode) {
-          return { prependSystemContext: "Output only NO_REPLY." };
-        }
 
         const agentId = trimString(ctx.agentId);
         if (!agentId || !managedAgentIds.has(agentId)) return;
@@ -534,6 +541,8 @@ export default {
         if (!conv) return;
 
         const transcript = formatBufferTranscript(conv.buffer, agentLabelById, maxPromptChars);
+
+        log(`before_prompt_build ${agentId} bufferSize=${conv.buffer.length} transcriptLen=${transcript.length}`);
 
         return {
           prependSystemContext: [
@@ -555,28 +564,61 @@ export default {
         const channelId = trimString(ctx.channelId);
         if (!isEnabled(channelId)) return;
 
-        if (quietMode) return { cancel: true };
+        const agentId = resolveOutboundAgentId(
+          trimString(ctx.accountId) || undefined, event.metadata, agentByAccount,
+        );
+
+        if (agentId && quietAgents.has(agentId)) return { cancel: true };
 
         if (trimString(event.content) === "NO_REPLY") return { cancel: true };
 
-        const accountId = trimString(ctx.accountId);
-        const agentId = resolveOutboundAgentId(
-          accountId || undefined, event.metadata, agentByAccount,
-        );
-        if (!agentId || !managedAgentIds.has(agentId)) return;
-
+        // Resolve conversation early — pendingResponse check must run even
+        // when agentId resolution fails (accountId format mismatch).
         const conversationKey = resolveOutboundConversationKey(
           channelId, ctx.conversationId, event.to, event.metadata,
         );
-        if (!conversationKey) return { cancel: true };
+        const conv = conversationKey ? conversations.get(conversationKey) : undefined;
 
-        const conv = conversations.get(conversationKey);
+        if (!conv && conversations.size > 0) {
+          api.logger.warn?.(`arbiter: message_sending conv miss: key=${conversationKey} convId=${ctx.conversationId} to=${event.to} accountId=${ctx.accountId} known=[${[...conversations.keys()].join(",")}]`);
+        }
+
+        // Block if another agent already responded in this round.
+        // This check does NOT depend on agentId resolution.
+        if (conv?.pendingResponse) {
+          log(`cancelled send in ${conversationKey}: another agent already responded`);
+          return { cancel: true };
+        }
+
+        // If we can't identify this as a managed agent, still mark the
+        // response so other agents' stale dispatches are blocked.
+        if (!agentId || !managedAgentIds.has(agentId)) {
+          if (conv) {
+            conv.pendingResponse = true;
+            cancelOtherAgents(conv);
+          }
+          return;
+        }
+
+        // --- Managed agent path (agentId resolved) ---
+
+        if (!conversationKey) {
+          if (!failOpen) return { cancel: true };
+          return;
+        }
+
         const run = conv?.agentRuns.get(agentId);
 
         // Stale run check: if this run has been superseded, cancel
         const eventRunId = resolveRunId(event.metadata);
         if (run?.runId && eventRunId && run.runId !== eventRunId) {
           log(`cancelled stale send from ${agentId}: run superseded`);
+          return { cancel: true };
+        }
+
+        // If this agent was cancelled (another agent responded first), block
+        if (run?.cancelled) {
+          log(`cancelled stale send from ${agentId}: superseded by another agent`);
           return { cancel: true };
         }
 
@@ -593,10 +635,15 @@ export default {
           }, maxBuffer);
         }
 
-        // Mark agent as done thinking
+        // Mark agent as done thinking and abort other agents still thinking
+        // in this conversation — the first response wins.
         if (run) {
           run.runId = undefined;
           run.thinking = false;
+        }
+        if (conv) {
+          conv.pendingResponse = true;
+          cancelOtherAgents(conv, agentId);
         }
 
         log(`send from ${agentId} in ${conversationKey}`);
@@ -606,39 +653,13 @@ export default {
       }
     });
 
-    // --- message_sent: trigger other agents to react ---
-
-    api.on("message_sent", async (event, ctx) => {
-      try {
-        if (!event.success) return;
-
-        const channelId = trimString(ctx.channelId);
-        if (!isEnabled(channelId)) return;
-
-        const accountId = trimString(ctx.accountId);
-        const agentId = resolveOutboundAgentId(
-          accountId || undefined, event.metadata, agentByAccount,
-        );
-        if (!agentId) return;
-
-        const conversationKey = resolveOutboundConversationKey(
-          channelId, ctx.conversationId, event.to, event.metadata,
-        );
-        if (!conversationKey) return;
-
-        const conv = conversations.get(conversationKey);
-        if (!conv) return;
-
-        // Trigger other agents to consider responding (fire-and-forget to avoid blocking the hook)
-        queueTriggerAgents(conv, agentId);
-      } catch (err) {
-        api.logger.warn?.(`arbiter: message_sent failed: ${err}`);
-      }
-    });
+    // --- message_sent: no action needed ---
+    // Other agents are triggered via Discord's message echo (normal dispatch).
+    // The arbiter no longer needs to enqueue them.
 
     // --- agent_end: cleanup run state ---
 
-    api.on("agent_end", async (_event, ctx) => {
+    api.on("agent_end", async (event, ctx) => {
       try {
         const channelId = trimString(ctx.channelId);
         if (!isEnabled(channelId)) return;
@@ -650,9 +671,45 @@ export default {
         if (!conversationKey) return;
 
         const conv = conversations.get(conversationKey);
-        if (conv) {
-          handleAgentRunCompleted(conv, agentId);
+        const run = conv?.agentRuns.get(agentId);
+        if (run) {
+          run.runId = undefined;
+          run.thinking = false;
         }
+
+        // Extract agent's response from event.messages and add to buffer.
+        // This is necessary because message_sending doesn't fire for extension
+        // plugins, and the re-dispatch carries the original user message.
+        if (conv && Array.isArray(event.messages) && event.messages.length > 0) {
+          const msg = event.messages[event.messages.length - 1] as Record<string, unknown> | undefined;
+          let responseText = "";
+          const rawContent = msg?.content;
+          if (typeof rawContent === "string") {
+            responseText = rawContent.trim();
+          } else if (Array.isArray(rawContent)) {
+            responseText = rawContent
+              .filter((b: unknown) => b && typeof b === "object" && (b as { type?: string }).type === "text")
+              .map((b: unknown) => (b as { text?: string }).text ?? "")
+              .join("\n")
+              .trim();
+          }
+          // Strip internal markers (e.g. [[reply_to_current]])
+          responseText = responseText.replace(/\[\[[^\]]*\]\]\s*/g, "").trim();
+          if (responseText && responseText !== "NO_REPLY") {
+            const messageId = generateId();
+            seenMessageIds.add(messageId);
+            addToBuffer(conv, {
+              messageId,
+              kind: "agent",
+              content: responseText,
+              senderAgentId: agentId,
+              timestamp: Date.now(),
+            }, maxBuffer);
+            log(`agent_end buffered ${agentId}: ${responseText.slice(0, 50)} (bufSize=${conv.buffer.length})`);
+          }
+        }
+
+        log(`agent_end ${agentId} convKey=${conversationKey}`);
       } catch (err) {
         api.logger.warn?.(`arbiter: agent_end failed: ${err}`);
       }

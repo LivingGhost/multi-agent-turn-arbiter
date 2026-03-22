@@ -8,29 +8,29 @@ When multiple managed agents share a chat, this plugin lets each agent autonomou
 
 The design is simple:
 
-- Every new message triggers all agents to think in parallel
-- Each agent's LLM decides whether to respond or stay silent (NO_REPLY)
-- If a new message arrives while an agent is thinking, the stale thought is cancelled and the agent re-thinks with the latest context
+- Agents respond via normal Discord dispatch — each bot account receives messages and runs its own agent
+- If a new message arrives while an agent is thinking, the stale run is cancelled via `agent.abort` and the agent re-runs with the latest context
 - Sending is gated so stale responses from superseded runs are dropped
-- After an agent speaks, other agents are triggered to consider responding
+- Each agent's LLM decides whether to respond or stay silent (NO_REPLY)
+- A shared message buffer supplements session history with other agents' messages
 
 ## How It Works
 
-The plugin maintains a short in-memory message buffer per conversation to supplement session history with messages that haven't been persisted yet (e.g., immediately after a send).
+The plugin maintains a short in-memory message buffer per conversation. This provides cross-agent context that isn't in each agent's individual session history.
 
 Hooks used:
 
-- `message_received` — adds to buffer, triggers all agents to think (cancels stale runs)
+- `message_received` — adds to buffer, cancels stale agent runs via `agent.abort`
+- `before_agent_start` — records runId for abort tracking
 - `before_prompt_build` — injects buffer context and participation prompt
-- `message_sending` — drops NO_REPLY and stale-run output
-- `message_sent` — triggers other agents to react to the new message
+- `message_sending` — drops NO_REPLY, stale-run output, and quiet agent output
 - `agent_end` — cleans up run state
 
 ## Commands
 
 | Command | Effect |
 | --- | --- |
-| `/quiet` | Immediately silences all agents. Cancels in-progress thinking and blocks further responses. Agents automatically resume when the user sends a new message. |
+| `/quiet` | Silences the agent this command is sent to. Cancels in-progress thinking and aborts new runs immediately. The agent resumes when a user sends a new message. |
 
 ## Installation
 
@@ -77,9 +77,9 @@ Then allow and enable it in `openclaw.json`:
 ## Limits
 
 - Agent participation decisions depend on LLM judgment. Persona prompts influence how often each agent speaks.
-- If a model run has already started, cancellation is best-effort through `subagent.abort(...)`.
+- Cancellation is best-effort through `agent.abort`. If a run has already produced output, `message_sending` drops it.
 - The buffer is short-lived in-memory state. Older context comes from normal OpenClaw session history.
-- Use `/quiet` if agents become too chatty. They resume on your next message.
+- Use `/quiet` on an agent to silence it individually. It resumes on the next user message.
 
 ## Repo Layout
 
