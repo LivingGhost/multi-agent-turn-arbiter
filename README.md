@@ -58,6 +58,14 @@ Metadata is stored at two levels:
 
 Both levels use generic `Record<string, string>` storage. The plugin auto-extracts string-valued fields from event metadata and classifies them by a configurable set of conversation-level keys. Everything else is treated as per-message metadata. This works across channel providers without hardcoding provider-specific fields.
 
+## Tools
+
+| Tool | Description |
+| --- | --- |
+| `conversation_history` | Retrieve earlier messages from the multi-agent conversation. Supports `offset` (skip recent), `limit` (max results), and `agentId` (filter by participant). When the buffer is empty (e.g. after restart), falls back to reading the target agent's session history. Returns the same format as the auto-injected prompt context. |
+
+Agents are prompted to use this tool when they need older context not shown in the recent transcript.
+
 ## Commands
 
 | Command | Effect |
