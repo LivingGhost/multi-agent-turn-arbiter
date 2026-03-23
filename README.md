@@ -31,30 +31,31 @@ The buffer is injected into each agent's prompt as a timestamped transcript:
 
 ```
 --- Recent context (oldest → newest, trimmed from older side) ---
-channelName: test4 | surface: discord
+channelName: general | provider: discord
 
-[2026-03-23T16:55:31.000Z] sd:
-3段階テスト。このメッセージを最初に読んだエージェントは100を返して。
+[alice (198234567890123456)|2026-01-15T09:30:12.000Z|msg:1480001234567890001]
+Has anyone looked into the deployment issue from yesterday?
 
-[2026-03-23T16:57:19.310Z] rek:
-  (model: claude-opus-4-6, provider: anthropic)
-100
+[Agent-1 (agent-1)|2026-01-15T09:30:45.200Z|msg:1480001234567890002|session:agent:agent-1:discord:channel:1480000000000000001]
+Yes, the root cause was a misconfigured health check timeout.
+I pushed a fix to staging — it should be verified by now.
 
-[2026-03-23T16:57:57.952Z] nimel:
-42
+[Agent-2 (agent-2)|2026-01-15T09:31:02.800Z|session:agent:agent-2:discord:channel:1480000000000000001]
+Confirmed, staging looks healthy. The fix can go to production.
 ```
 
-- ISO 8601 timestamps
-- Conversation-level metadata in header (channel name, surface, provider — captured generically from any channel)
-- Per-message metadata shown inline when present (media type, reply-to, model, etc.)
-- Internal IDs and arbiter-specific markers are not exposed
+- Each message has a `[header]` line with sender, timestamp, and references, followed by content on the next line(s)
+- `msg:<id>` links to the provider's message ID (when available)
+- `session:<key>` links to the agent's session history (for agents only)
+- Sender IDs in parentheses distinguish users/agents with similar names
+- Conversation-level metadata appears once in the header (channel, provider, etc.)
 
 ### Metadata
 
 Metadata is stored at two levels:
 
-- **Conversation level** — channel name, surface, provider, guild ID, etc. Captured from the first message and shown in the transcript header.
-- **Message level** — media type, reply-to, thread ID, model/provider for agent responses. Shown inline under each message when present.
+- **Conversation level** — channel name, provider, guild ID, etc. Captured from the first message and shown in the transcript header.
+- **Message level** — media type, reply-to, thread ID, etc. Shown in the message header when present.
 
 Both levels use generic `Record<string, string>` storage. The plugin auto-extracts string-valued fields from event metadata and classifies them by a configurable set of conversation-level keys. Everything else is treated as per-message metadata. This works across channel providers without hardcoding provider-specific fields.
 
