@@ -9,7 +9,6 @@ type ArbiterConfig = {
   maxBufferMessages?: number;
   stateIdleMs?: number;
   maxPromptChars?: number;
-  failOpen?: boolean;
   debug?: boolean;
 };
 
@@ -29,6 +28,7 @@ type BufferedMessage = {
   senderAgentId?: string;
   senderName?: string;
   senderKey?: string;
+  metadata?: Record<string, string>;
   timestamp: number;
 };
 
@@ -42,6 +42,7 @@ type ConversationState = {
   conversationKey: string;
   channelId: string;
   conversationId: string;
+  metadata: Record<string, string>;
   buffer: BufferedMessage[];
   agentRuns: Map<string, AgentRunState>;
   pendingResponse: boolean;
@@ -84,10 +85,6 @@ function resolveInboundSenderKey(metadata?: Record<string, unknown>): string | u
   ]);
 }
 
-function resolveRunId(metadata?: Record<string, unknown>): string | undefined {
-  return getMetadataString(metadata, ["runId", "run_id"]);
-}
-
 function resolveMessageId(event: {
   timestamp?: number;
   from: string;
@@ -108,18 +105,6 @@ function resolveInboundConversationKey(
 ): string | null {
   const threadId = getMetadataString(metadata, ["threadId", "thread_id"]);
   const base = threadId || trimString(conversationId);
-  if (!channelId || !base) return null;
-  return `${channelId}:${base}`;
-}
-
-function resolveOutboundConversationKey(
-  channelId: string,
-  conversationId: string | undefined,
-  to: string,
-  metadata?: Record<string, unknown>,
-): string | null {
-  const threadId = getMetadataString(metadata, ["threadId", "thread_id"]);
-  const base = threadId || trimString(conversationId) || trimString(to);
   if (!channelId || !base) return null;
   return `${channelId}:${base}`;
 }
@@ -234,30 +219,77 @@ function resolveInboundManagedAgentId(params: {
   return managedAgentBySenderKey.get(makeConversationSenderKey(params.channelId, senderKey));
 }
 
-function resolveOutboundAgentId(
-  accountId: string | undefined,
-  metadata: Record<string, unknown> | undefined,
-  agentByAccount: Map<string, string>,
-): string | undefined {
-  const directAgentId = getMetadataString(metadata, ["agentId", "agent_id"]);
-  if (directAgentId) return directAgentId;
-  const normalizedAccountId = trimString(accountId);
-  if (!normalizedAccountId) return undefined;
-  return agentByAccount.get(normalizedAccountId);
-}
-
 // --- Transcript formatting ---
+
+// Metadata keys that belong to the conversation, not individual messages.
+const CONVERSATION_META_KEYS = new Set([
+  "channelName", "channel_name",
+  "guildId", "guild_id",
+  "provider",
+  "chatType", "chat_type",
+  "channelType", "channel_type",
+]);
+
+// Metadata keys that duplicate other keys and should be suppressed entirely.
+const SUPPRESSED_META_KEYS = new Set([
+  "surface", // always same value as provider
+]);
+
+// Metadata keys that are used internally for sender/message identification
+// and should not be forwarded to the per-message metadata display.
+// messageId is shown in the header line as msg:<id>, so excluded here.
+const INTERNAL_META_KEYS = new Set([
+  "messageId", "message_id", "id", "eventId", "event_id",
+  "senderId", "sender_id", "authorId", "author_id",
+  "userId", "user_id", "fromId", "from_id",
+  "senderName", "authorName",
+  "senderAgentId", "sender_agent_id",
+  "senderManagedAccountId", "sender_managed_account_id",
+  "managedAccountId", "managed_account_id",
+  "senderUsername", "senderE164",
+  "to", "originatingChannel", "originatingTo",
+]);
+
+function extractStringMetadata(
+  source: Record<string, unknown> | undefined,
+): Record<string, string> {
+  if (!source || typeof source !== "object") return {};
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(source)) {
+    const str = trimString(value);
+    if (str) out[key] = str;
+  }
+  return out;
+}
 
 function formatBufferTranscript(
   buffer: BufferedMessage[],
   agentLabelById: Map<string, string>,
+  conversationKey: string,
   maxChars: number,
 ): string {
   const entries = buffer.map((m) => {
-    const sender = m.senderAgentId
+    const name = m.senderAgentId
       ? agentLabelById.get(m.senderAgentId) ?? m.senderAgentId
       : m.senderName ?? m.senderKey ?? "user";
-    return `${sender} (messageId=${m.messageId}):\n${m.content}`;
+    const id = m.senderAgentId ?? m.senderKey;
+    const sender = id && id !== name ? `${name} (${id})` : name;
+    const time = new Date(m.timestamp).toISOString();
+
+    // Build header parts: sender | time | references...
+    const headerParts = [sender, time];
+    if (m.messageId && !m.messageId.startsWith("arbiter-")) {
+      headerParts.push(`msg:${m.messageId}`);
+    }
+    if (m.senderAgentId) {
+      headerParts.push(`session:agent:${m.senderAgentId}:${conversationKey}`);
+    }
+    if (m.metadata) {
+      for (const [k, v] of Object.entries(m.metadata)) {
+        headerParts.push(`${k}:${v}`);
+      }
+    }
+    return `[${headerParts.map((p) => p.replace(/\[/g, "%5B").replace(/\]/g, "%5D").replace(/\|/g, "%7C")).join("|")}]\n${m.content}`;
   });
 
   if (maxChars === -1) return entries.join("\n\n");
@@ -265,7 +297,11 @@ function formatBufferTranscript(
   const selected: string[] = [];
   let used = 0;
   for (let i = entries.length - 1; i >= 0; i--) {
-    const entry = entries[i];
+    let entry = entries[i];
+    // Truncate an oversized entry to fit within the budget.
+    if (selected.length === 0 && entry.length > maxChars) {
+      entry = entry.slice(0, maxChars - 15) + "\n[...truncated]";
+    }
     const next = used + entry.length + (selected.length > 0 ? 2 : 0);
     if (selected.length > 0 && next > maxChars) break;
     selected.unshift(entry);
@@ -298,6 +334,7 @@ function getConversation(
       conversationKey,
       channelId,
       conversationId,
+      metadata: {},
       buffer: [],
       agentRuns: new Map(),
       pendingResponse: false,
@@ -352,7 +389,6 @@ export default {
     const maxBuffer = Math.max(10, Math.floor(cfg.maxBufferMessages ?? 50));
     const stateIdleMs = Math.max(60_000, Math.floor(cfg.stateIdleMs ?? 300_000));
     const maxPromptChars = cfg.maxPromptChars === -1 ? -1 : Math.max(4_000, Math.floor(cfg.maxPromptChars ?? 30_000));
-    const failOpen = typeof cfg.failOpen === "boolean" ? cfg.failOpen : true;
     const debug = cfg.debug === true;
 
     const agentAccounts = buildAgentAccounts(api.config as OpenClawConfig);
@@ -450,15 +486,63 @@ export default {
           trimString(ctx.conversationId) || conversationKey.slice(`${channelId}:`.length);
         const conv = getConversation(conversationKey, channelId, conversationId);
 
-        addToBuffer(conv, {
-          messageId,
-          kind: senderAgentId ? "agent" : "external",
-          content: event.content,
-          senderAgentId,
-          senderName: getMetadataString(event.metadata, ["senderName", "authorName"]),
-          senderKey,
-          timestamp: event.timestamp ?? Date.now(),
-        }, maxBuffer);
+        // Extract all string metadata from the event.
+        const allMeta = extractStringMetadata(event.metadata);
+
+        // Capture conversation-level metadata (channel, surface, etc.)
+        // on the first message that carries it.
+        for (const [key, val] of Object.entries(allMeta)) {
+          if (CONVERSATION_META_KEYS.has(key) && !SUPPRESSED_META_KEYS.has(key) && !conv.metadata[key]) {
+            conv.metadata[key] = val;
+          }
+        }
+
+        // Collect per-message metadata (everything except conversation-level
+        // and sender fields already handled separately).
+        const msgMeta: Record<string, string> = {};
+        for (const [key, val] of Object.entries(allMeta)) {
+          if (!CONVERSATION_META_KEYS.has(key) && !INTERNAL_META_KEYS.has(key) && !SUPPRESSED_META_KEYS.has(key)) {
+            msgMeta[key] = val;
+          }
+        }
+
+        // If this is an echo of an agent message already in the buffer
+        // (added by agent_end), backfill the provider messageId and metadata
+        // instead of adding a duplicate.
+        if (senderAgentId) {
+          const existing = conv.buffer.find(
+            (m) => m.senderAgentId === senderAgentId && m.kind === "agent" && m.content === event.content && m.messageId.startsWith("arbiter-"),
+          );
+          if (existing) {
+            existing.messageId = messageId;
+            if (Object.keys(msgMeta).length > 0) {
+              existing.metadata = { ...existing.metadata, ...msgMeta };
+            }
+            log(`backfilled messageId=${messageId} for ${senderAgentId}`);
+            // Still proceed with pendingResponse reset and cancel below
+          } else {
+            addToBuffer(conv, {
+              messageId,
+              kind: "agent",
+              content: event.content,
+              senderAgentId,
+              senderName: getMetadataString(event.metadata, ["senderName", "authorName"]),
+              senderKey,
+              timestamp: event.timestamp ?? Date.now(),
+              ...(Object.keys(msgMeta).length > 0 ? { metadata: msgMeta } : {}),
+            }, maxBuffer);
+          }
+        } else {
+          addToBuffer(conv, {
+            messageId,
+            kind: "external",
+            content: event.content,
+            senderName: getMetadataString(event.metadata, ["senderName", "authorName"]),
+            senderKey,
+            timestamp: event.timestamp ?? Date.now(),
+            ...(Object.keys(msgMeta).length > 0 ? { metadata: msgMeta } : {}),
+          }, maxBuffer);
+        }
 
         // New message received — clear pending response flag so fresh
         // dispatches triggered by this message can proceed.
@@ -540,7 +624,7 @@ export default {
         const conv = conversations.get(conversationKey);
         if (!conv) return;
 
-        const transcript = formatBufferTranscript(conv.buffer, agentLabelById, maxPromptChars);
+        const transcript = formatBufferTranscript(conv.buffer, agentLabelById, conversationKey, maxPromptChars);
 
         log(`before_prompt_build ${agentId} bufferSize=${conv.buffer.length} transcriptLen=${transcript.length}`);
 
@@ -550,112 +634,27 @@ export default {
             "Respond naturally if you have something to contribute.",
             "If you have nothing to add, output only NO_REPLY.",
           ].join(" "),
-          ...(transcript ? { prependContext: `Recent conversation:\n\n${transcript}` } : {}),
+          ...(transcript ? {
+            prependContext: [
+              "--- Recent context (oldest → newest, trimmed from older side) ---",
+              ...(Object.keys(conv.metadata).length > 0
+                ? [Object.entries(conv.metadata).map(([k, v]) => `${k}: ${v}`).join(" | ")]
+                : []),
+              "",
+              transcript,
+            ].join("\n"),
+          } : {}),
         };
       } catch (err) {
         api.logger.warn?.(`arbiter: before_prompt_build failed: ${err}`);
       }
     });
 
-    // --- message_sending: gate outbound messages ---
-
-    api.on("message_sending", async (event, ctx) => {
-      try {
-        const channelId = trimString(ctx.channelId);
-        if (!isEnabled(channelId)) return;
-
-        const agentId = resolveOutboundAgentId(
-          trimString(ctx.accountId) || undefined, event.metadata, agentByAccount,
-        );
-
-        if (agentId && quietAgents.has(agentId)) return { cancel: true };
-
-        if (trimString(event.content) === "NO_REPLY") return { cancel: true };
-
-        // Resolve conversation early — pendingResponse check must run even
-        // when agentId resolution fails (accountId format mismatch).
-        const conversationKey = resolveOutboundConversationKey(
-          channelId, ctx.conversationId, event.to, event.metadata,
-        );
-        const conv = conversationKey ? conversations.get(conversationKey) : undefined;
-
-        if (!conv && conversations.size > 0) {
-          api.logger.warn?.(`arbiter: message_sending conv miss: key=${conversationKey} convId=${ctx.conversationId} to=${event.to} accountId=${ctx.accountId} known=[${[...conversations.keys()].join(",")}]`);
-        }
-
-        // Block if another agent already responded in this round.
-        // This check does NOT depend on agentId resolution.
-        if (conv?.pendingResponse) {
-          log(`cancelled send in ${conversationKey}: another agent already responded`);
-          return { cancel: true };
-        }
-
-        // If we can't identify this as a managed agent, still mark the
-        // response so other agents' stale dispatches are blocked.
-        if (!agentId || !managedAgentIds.has(agentId)) {
-          if (conv) {
-            conv.pendingResponse = true;
-            cancelOtherAgents(conv);
-          }
-          return;
-        }
-
-        // --- Managed agent path (agentId resolved) ---
-
-        if (!conversationKey) {
-          if (!failOpen) return { cancel: true };
-          return;
-        }
-
-        const run = conv?.agentRuns.get(agentId);
-
-        // Stale run check: if this run has been superseded, cancel
-        const eventRunId = resolveRunId(event.metadata);
-        if (run?.runId && eventRunId && run.runId !== eventRunId) {
-          log(`cancelled stale send from ${agentId}: run superseded`);
-          return { cancel: true };
-        }
-
-        // If this agent was cancelled (another agent responded first), block
-        if (run?.cancelled) {
-          log(`cancelled stale send from ${agentId}: superseded by another agent`);
-          return { cancel: true };
-        }
-
-        // Record this message in buffer immediately (before Discord echo)
-        if (conv) {
-          const messageId = generateId();
-          seenMessageIds.add(messageId);
-          addToBuffer(conv, {
-            messageId,
-            kind: "agent",
-            content: event.content,
-            senderAgentId: agentId,
-            timestamp: Date.now(),
-          }, maxBuffer);
-        }
-
-        // Mark agent as done thinking and abort other agents still thinking
-        // in this conversation — the first response wins.
-        if (run) {
-          run.runId = undefined;
-          run.thinking = false;
-        }
-        if (conv) {
-          conv.pendingResponse = true;
-          cancelOtherAgents(conv, agentId);
-        }
-
-        log(`send from ${agentId} in ${conversationKey}`);
-      } catch (err) {
-        api.logger.warn?.(`arbiter: message_sending failed: ${err}`);
-        if (!failOpen) return { cancel: true };
-      }
-    });
-
-    // --- message_sent: no action needed ---
-    // Other agents are triggered via Discord's message echo (normal dispatch).
-    // The arbiter no longer needs to enqueue them.
+    // NOTE: message_sending hook is not invoked for extension plugins in the
+    // current openclaw runtime. All send-time gating (cancel, pendingResponse,
+    // stale-run checks) was removed as dead code. If openclaw begins invoking
+    // message_sending for extensions in the future, outbound gating can be
+    // re-added here.
 
     // --- agent_end: cleanup run state ---
 
@@ -672,9 +671,19 @@ export default {
 
         const conv = conversations.get(conversationKey);
         const run = conv?.agentRuns.get(agentId);
+        const wasCancelled = run?.cancelled === true;
         if (run) {
           run.runId = undefined;
           run.thinking = false;
+          run.cancelled = false;
+        }
+
+        // Skip buffering if the run was cancelled (e.g., user sent a new
+        // message mid-thinking). The response is stale and would pollute
+        // the buffer for subsequent agents.
+        if (wasCancelled) {
+          log(`agent_end ${agentId} skipped buffering: run was cancelled`);
+          return;
         }
 
         // Extract agent's response from event.messages and add to buffer.

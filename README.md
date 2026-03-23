@@ -10,9 +10,9 @@ The design is simple:
 
 - Agents respond via normal Discord dispatch — each bot account receives messages and runs its own agent
 - If a new message arrives while an agent is thinking, the stale run is cancelled via `agent.abort` and the agent re-runs with the latest context
-- Sending is gated so stale responses from superseded runs are dropped
 - Each agent's LLM decides whether to respond or stay silent (NO_REPLY)
 - A shared message buffer supplements session history with other agents' messages
+- Agent responses are captured in `agent_end` and added to the buffer so subsequent agents see them
 
 ## How It Works
 
@@ -20,11 +20,43 @@ The plugin maintains a short in-memory message buffer per conversation. This pro
 
 Hooks used:
 
-- `message_received` — adds to buffer, cancels stale agent runs via `agent.abort`
-- `before_agent_start` — records runId for abort tracking
-- `before_prompt_build` — injects buffer context and participation prompt
-- `message_sending` — drops NO_REPLY, stale-run output, and quiet agent output
-- `agent_end` — cleans up run state
+- `message_received` — adds to buffer, captures metadata, cancels stale agent runs via `agent.abort`
+- `before_agent_start` — records runId for abort tracking, blocks stale dispatches via `pendingResponse`
+- `before_prompt_build` — injects buffer context with timestamps and conversation metadata
+- `agent_end` — extracts agent response from `event.messages`, adds to buffer, cleans up run state
+
+### Prompt Format
+
+The buffer is injected into each agent's prompt as a timestamped transcript:
+
+```
+--- Recent context (oldest → newest, trimmed from older side) ---
+channelName: test4 | surface: discord
+
+[2026-03-23T16:55:31.000Z] sd:
+3段階テスト。このメッセージを最初に読んだエージェントは100を返して。
+
+[2026-03-23T16:57:19.310Z] rek:
+  (model: claude-opus-4-6, provider: anthropic)
+100
+
+[2026-03-23T16:57:57.952Z] nimel:
+42
+```
+
+- ISO 8601 timestamps
+- Conversation-level metadata in header (channel name, surface, provider — captured generically from any channel)
+- Per-message metadata shown inline when present (media type, reply-to, model, etc.)
+- Internal IDs and arbiter-specific markers are not exposed
+
+### Metadata
+
+Metadata is stored at two levels:
+
+- **Conversation level** — channel name, surface, provider, guild ID, etc. Captured from the first message and shown in the transcript header.
+- **Message level** — media type, reply-to, thread ID, model/provider for agent responses. Shown inline under each message when present.
+
+Both levels use generic `Record<string, string>` storage. The plugin auto-extracts string-valued fields from event metadata and classifies them by a configurable set of conversation-level keys. Everything else is treated as per-message metadata. This works across channel providers without hardcoding provider-specific fields.
 
 ## Commands
 
@@ -53,7 +85,6 @@ Then allow and enable it in `openclaw.json`:
           "maxBufferMessages": 50,
           "stateIdleMs": 300000,
           "maxPromptChars": 30000,
-          "failOpen": true,
           "debug": false
         }
       }
@@ -71,18 +102,19 @@ Then allow and enable it in `openclaw.json`:
 | `maxBufferMessages` | Maximum messages kept in the per-conversation buffer. Default: `50`. |
 | `stateIdleMs` | Idle timeout for clearing conversation state. Default: `300000`. |
 | `maxPromptChars` | Character budget for buffer context injected into prompts. `-1` for unlimited. Default: `30000`. |
-| `failOpen` | If true, allow delivery on plugin errors instead of blocking. Default: `true`. |
 | `debug` | Enables verbose plugin logging. Default: `false`. |
 
-## Limits
+## Known Limitations
 
 - Agent participation decisions depend on LLM judgment. Persona prompts influence how often each agent speaks.
-- Cancellation is best-effort through `agent.abort`. If a run has already produced output, `message_sending` drops it.
+- Cancellation is best-effort through `agent.abort`. The abort may not take effect if the agent has already completed inference.
+- `message_sending` hook does not fire for extension plugins in the current openclaw runtime. Outbound gating (cancel stale responses, quiet agent suppression) is not possible at the plugin level.
 - The buffer is short-lived in-memory state. Older context comes from normal OpenClaw session history.
-- Use `/quiet` on an agent to silence it individually. It resumes on the next user message.
+- Agents are dispatched sequentially (not in parallel) by openclaw. The buffer captures each agent's response in `agent_end` so subsequent agents see prior responses.
 
 ## Repo Layout
 
 - `index.ts`: plugin implementation
+- `index.test.ts`: test suite
 - `openclaw.plugin.json`: plugin manifest and config schema
 - `package.json`: package metadata
