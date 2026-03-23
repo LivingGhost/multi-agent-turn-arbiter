@@ -438,6 +438,111 @@ export default {
       }
     }
 
+    // --- conversation_history tool ---
+
+    api.registerTool({
+      name: "conversation_history",
+      label: "Conversation History",
+      description: [
+        "Retrieve earlier messages from this multi-agent conversation.",
+        "Returns messages in the same format as the Recent context injected into your prompt.",
+        "Use offset to page through older messages. Use agentId to filter by participant.",
+        "For messages not in the buffer (e.g. after restart), the tool reads session history from other agents.",
+      ].join(" "),
+      parameters: {
+        type: "object",
+        properties: {
+          offset: { type: "number", description: "Number of recent messages to skip (0 = most recent). Default: 0.", minimum: 0 },
+          limit: { type: "number", description: "Maximum messages to return (1-50). Default: 20.", minimum: 1, maximum: 50 },
+          agentId: { type: "string", description: "Filter to a specific agent's messages. Omit for all participants." },
+        },
+        additionalProperties: false,
+      },
+      execute: async (_toolCallId: string, rawParams: Record<string, unknown>) => {
+        const offset = Math.max(0, Math.floor(Number(rawParams.offset) || 0));
+        const limit = Math.min(50, Math.max(1, Math.floor(Number(rawParams.limit) || 20)));
+        const filterAgentId = trimString(rawParams.agentId) || undefined;
+
+        // Find the conversation for this request. Since we don't have the
+        // session key in tool context, pick the most recently updated conversation.
+        let conv: ConversationState | undefined;
+        for (const c of conversations.values()) {
+          if (!conv || c.updatedAt > conv.updatedAt) {
+            conv = c;
+          }
+        }
+
+        if (!conv) {
+          return { content: [{ type: "text", text: JSON.stringify({ messages: [], total: 0, note: "No active conversation found." }, null, 2) }] };
+        }
+
+        // Filter buffer
+        let filtered = conv.buffer;
+        if (filterAgentId) {
+          filtered = filtered.filter((m) => m.senderAgentId === filterAgentId);
+        }
+
+        const total = filtered.length;
+        const start = Math.max(0, filtered.length - offset - limit);
+        const end = Math.max(0, filtered.length - offset);
+        const page = filtered.slice(start, end);
+
+        // Format in the same style as the prompt transcript
+        const transcript = formatBufferTranscript(page, agentLabelById, conv.conversationKey, -1);
+
+        // If buffer is empty or exhausted and an agentId is specified,
+        // try reading from that agent's session history as a fallback.
+        let sessionFallback: string | undefined;
+        if (page.length === 0 && filterAgentId && managedAgentIds.has(filterAgentId)) {
+          try {
+            const sessionKey = `agent:${filterAgentId}:${conv.conversationKey}`;
+            const result = await api.runtime.subagent.getSessionMessages({ sessionKey, limit });
+            if (Array.isArray(result.messages) && result.messages.length > 0) {
+              const sessionMessages: BufferedMessage[] = result.messages
+                .filter((m: unknown) => m && typeof m === "object" && (m as { role?: string }).role === "assistant")
+                .map((m: unknown) => {
+                  const msg = m as Record<string, unknown>;
+                  let text = "";
+                  const rawContent = msg.content;
+                  if (typeof rawContent === "string") {
+                    text = rawContent.trim();
+                  } else if (Array.isArray(rawContent)) {
+                    text = rawContent
+                      .filter((b: unknown) => b && typeof b === "object" && (b as { type?: string }).type === "text")
+                      .map((b: unknown) => (b as { text?: string }).text ?? "")
+                      .join("\n")
+                      .trim();
+                  }
+                  text = text.replace(/\[\[[^\]]*\]\]\s*/g, "").trim();
+                  return {
+                    messageId: trimString(msg.responseId) || generateId(),
+                    kind: "agent" as const,
+                    content: text,
+                    senderAgentId: filterAgentId,
+                    timestamp: typeof msg.timestamp === "number" ? msg.timestamp : Date.now(),
+                  };
+                })
+                .filter((m) => m.content && m.content !== "NO_REPLY");
+              if (sessionMessages.length > 0) {
+                sessionFallback = formatBufferTranscript(sessionMessages, agentLabelById, conv.conversationKey, -1);
+              }
+            }
+          } catch {
+            // Session read failed — return buffer results only
+          }
+        }
+
+        const result = {
+          messages: transcript || sessionFallback || "(no messages)",
+          total,
+          offset,
+          limit,
+          ...(sessionFallback ? { source: "session_history" } : { source: "buffer" }),
+        };
+        return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }] };
+      },
+    });
+
     // --- /quiet command ---
 
     api.registerCommand({
@@ -633,6 +738,7 @@ export default {
             "You are a participant in this multi-agent conversation.",
             "Respond naturally if you have something to contribute.",
             "If you have nothing to add, output only NO_REPLY.",
+            "If you need older conversation context not shown below, use the conversation_history tool.",
           ].join(" "),
           ...(transcript ? {
             prependContext: [

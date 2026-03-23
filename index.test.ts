@@ -57,6 +57,7 @@ function createMockApi(overrides?: {
     registerCommand: vi.fn((cmd: { name: string; handler: CommandHandler }) => {
       commands.set(cmd.name, cmd.handler);
     }),
+    registerTool: vi.fn(),
   };
 
   return {
@@ -88,6 +89,15 @@ describe("multi-agent-turn-arbiter", () => {
   beforeEach(async () => {
     vi.resetModules();
     plugin = await loadPlugin();
+  });
+
+  it("registers conversation_history tool", () => {
+    const { api } = createMockApi();
+    plugin.register(api as never);
+
+    expect(api.registerTool).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "conversation_history" }),
+    );
   });
 
   it("registers expected hooks", () => {
