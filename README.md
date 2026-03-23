@@ -90,7 +90,7 @@ Then allow and enable it in `openclaw.json`:
       "multi-agent-turn-arbiter": {
         "enabled": true,
         "config": {
-          "maxBufferMessages": 50,
+          "maxBufferMessages": 10,
           "stateIdleMs": 300000,
           "maxPromptChars": 30000,
           "debug": false
@@ -107,7 +107,7 @@ Then allow and enable it in `openclaw.json`:
 | --- | --- |
 | `enabled` | Turns the plugin on or off. |
 | `enabledChannels` | Optional allowlist of channel IDs. Empty means all channels. |
-| `maxBufferMessages` | Maximum messages kept in the per-conversation buffer. Default: `50`. |
+| `maxBufferMessages` | Maximum messages kept in the per-conversation buffer. Default: `10`. Older messages are available via the `conversation_history` tool. |
 | `stateIdleMs` | Idle timeout for clearing conversation state. Default: `300000`. |
 | `maxPromptChars` | Character budget for buffer context injected into prompts. `-1` for unlimited. Default: `30000`. |
 | `debug` | Enables verbose plugin logging. Default: `false`. |

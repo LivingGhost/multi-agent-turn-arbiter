@@ -386,7 +386,7 @@ export default {
         ? cfg.enabledChannels.map((v) => trimString(v)).filter(Boolean)
         : [],
     );
-    const maxBuffer = Math.max(10, Math.floor(cfg.maxBufferMessages ?? 50));
+    const maxBuffer = Math.max(5, Math.floor(cfg.maxBufferMessages ?? 10));
     const stateIdleMs = Math.max(60_000, Math.floor(cfg.stateIdleMs ?? 300_000));
     const maxPromptChars = cfg.maxPromptChars === -1 ? -1 : Math.max(4_000, Math.floor(cfg.maxPromptChars ?? 30_000));
     const debug = cfg.debug === true;
